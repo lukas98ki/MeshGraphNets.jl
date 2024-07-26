@@ -41,9 +41,7 @@ Solves the ODEProblem of the MGN with the given solver.
 """
 function rollout(solver, mgn::GraphNetwork, initial_state, fields, meta, target_fields,
         target_dict, node_type, edge_features, senders, receivers, val_mask,
-        inflow_mask, data, start, stop, dt, saves; show_progress = true)
-    pr = show_progress ? ProgressUnknown(; showspeed = true) : nothing
-
+        inflow_mask, data, start, stop, dt, saves, pr = nothing)
     interval = (start, stop)
     x0 = vcat([initial_state[field] for field in target_fields]...)
     inputs = deepcopy(initial_state)
@@ -60,7 +58,7 @@ function rollout(solver, mgn::GraphNetwork, initial_state, fields, meta, target_
         sol = solve(prob, solver; adaptive = false, dt = dt, saveat = saves)
     end
 
-    if show_progress
+    if !isnothing(pr)
         finish!(pr)
     end
 

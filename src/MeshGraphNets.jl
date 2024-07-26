@@ -9,6 +9,7 @@ using GraphNetCore
 
 using CUDA
 using Lux, LuxCUDA
+using MLUtils
 using Optimisers
 using Wandb
 using Zygote
@@ -265,18 +266,20 @@ function train_network(noise_stddevs, opt, ds_path, cp_path; kws...)
     @info "Training with $(typeof(args.training_strategy))..."
 
     println("Loading training data...")
-    dataset = load_dataset(ds_path, true)
+    ds_train = Dataset(:train, ds_path)
+    ds_valid = Dataset(:valid, ds_path)
     clear_log(1, false)
     @info "Training data loaded!"
+    Threads.nthreads() < 2 && @warn "Julia is currently running on a single thread! Start Julia with more threads to speed up data loading."
 
     println("Building model...")
 
-    quantities, e_norms, n_norms, o_norms = calc_norms(dataset, device, args)
+    quantities, e_norms, n_norms, o_norms = calc_norms(ds_train, device, args)
 
-    dims = dataset.meta["dims"]
+    dims = ds_train.meta["dims"]
     outputs = 0
-    for tf in dataset.meta["target_features"]
-        outputs += dataset.meta["features"][tf]["dim"]
+    for tf in ds_train.meta["target_features"]
+        outputs += ds_train.meta["features"][tf]["dim"]
     end
 
     mgn, opt_state, df_train, df_valid = load(
@@ -295,7 +298,7 @@ function train_network(noise_stddevs, opt, ds_path, cp_path; kws...)
     print("\u1b[1G")
 
     min_validation_loss = train_mgn!(
-        mgn, opt_state, dataset, noise_stddevs, df_train, df_valid, device, cp_path, args)
+        mgn, opt_state, ds_train, ds_valid, noise_stddevs, df_train, df_valid, device, cp_path, args)
 
     return mgn, min_validation_loss
 end
@@ -319,8 +322,8 @@ Initializes the network and performs the training loop.
 ## Returns
 - Minimum of validation loss (for hyperparameter tuning).
 """
-function train_mgn!(mgn::GraphNetwork, opt_state, dataset::Dataset, noise,
-        df_train, df_valid, device, cp_path, args::Args)
+function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::Dataset,
+        noise, df_train, df_valid, device, cp_path, args::Args)
     checkpoint = length(df_train.step) > 0 ? last(df_train.step) : 0
     step = checkpoint
     cp_progress = 0
@@ -333,144 +336,148 @@ function train_mgn!(mgn::GraphNetwork, opt_state, dataset::Dataset, noise,
 
     pr = Progress(args.epochs * args.steps; desc = "Training progress: ",
         dt = 1.0, barlen = 50, start = checkpoint, showspeed = true)
-    update!(pr)
 
     local tmp_loss = 0.0f0
     local avg_loss = 0.0f0
-    fields = deleteat!(copy(dataset.meta["feature_names"]),
+    fields = deleteat!(copy(ds_train.meta["feature_names"]),
         findall(x -> x == "node_type" || x == "mesh_pos" || x == "cells",
-            dataset.meta["feature_names"]))
+        ds_train.meta["feature_names"]))
 
-    delta = get_delta(args.training_strategy, dataset.meta["trajectory_length"])
+    delta = get_delta(args.training_strategy, ds_train.meta["trajectory_length"])
 
     train_tuple_additional = prepare_training(args.training_strategy)
 
-    for _ in checkpoint:delta:(args.steps * args.epochs)
-        data, meta = next_trajectory!(dataset, device; types_noisy = args.types_noisy,
-            noise_stddevs = noise, ts = args.training_strategy)
+    train_loader = DataLoader(ds_train; batchsize = 0, buffer = true, parallel = true, shuffle = true)
+    valid_loader = DataLoader(ds_valid; batchsize = 0, buffer = true, parallel = true)
 
-        mask = Int32.(findall(x -> x in args.types_updated, data["node_type"][1, :, 1])) |>
-               device
+    while step < args.steps
+        for data in train_loader
+        # for _ in checkpoint:delta:(args.steps * args.epochs)
+            prepare_trajectory!(data, ds_train.meta, device; types_noisy = args.types_noisy, noise_stddevs = noise, ts = args.training_strategy)
+            # data, meta = next_trajectory!(dataset, device; types_noisy = args.types_noisy,
+            #     noise_stddevs = noise, ts = args.training_strategy)
 
-        val_mask = Float32.(map(x -> x in args.types_updated, data["node_type"][:, :, 1]))
-        val_mask = repeat(
-            val_mask, sum(size(data[field], 1) for field in meta["target_features"]), 1) |>
-                   device
+            mask = Int32.(findall(x -> x in args.types_updated, data["node_type"][1, :, 1])) |>
+                device
 
-        node_type, senders, receivers, edge_features = create_base_graph(
-            data, meta["features"]["node_type"]["data_max"],
-            meta["features"]["node_type"]["data_min"], device)
+            val_mask = Float32.(map(x -> x in args.types_updated, data["node_type"][:, :, 1]))
+            val_mask = repeat(
+                val_mask, sum(size(data[field], 1) for field in ds_train.meta["target_features"]), 1) |>
+                    device
 
-        for datapoint in 1:delta
-            train_tuple = init_train_step(args.training_strategy,
-                (mgn, data, meta, fields, meta["target_features"], node_type,
-                    edge_features, senders, receivers, datapoint, mask, val_mask),
-                train_tuple_additional)
+            node_type, senders, receivers, edge_features = create_base_graph(
+                data, ds_train.meta["features"]["node_type"]["data_max"],
+                ds_train.meta["features"]["node_type"]["data_min"], device)
 
-            gs, losses = train_step(args.training_strategy, train_tuple)
+            for datapoint in 1:delta
+                train_tuple = init_train_step(args.training_strategy,
+                    (mgn, data, ds_train.meta, fields, ds_train.meta["target_features"], node_type,
+                        edge_features, senders, receivers, datapoint, mask, val_mask),
+                    train_tuple_additional)
 
-            tmp_loss += sum(losses)
+                gs, losses = train_step(args.training_strategy, train_tuple)
 
-            if step + datapoint > args.norm_steps
-                for i in eachindex(gs)
-                    opt_state, ps = Optimisers.update(opt_state, mgn.ps, gs[i])
-                    mgn.ps = ps
+                tmp_loss += sum(losses)
+
+                if step + datapoint > args.norm_steps
+                    for i in eachindex(gs)
+                        opt_state, ps = Optimisers.update(opt_state, mgn.ps, gs[i])
+                        mgn.ps = ps
+                    end
+                    update!(pr, step + datapoint;
+                        showvalues = [
+                            (:train_step, "$(step + datapoint)/$(args.epochs*args.steps)"),
+                            (:train_loss, sum(losses)),
+                            (:checkpoint, length(df_train.step) > 0 ? last(df_train.step) : 0),
+                            (:data_interval, delta == 1 ? "1:end" : 1:delta),
+                            (:min_validation_loss, min_validation_loss),
+                            (:last_validation_loss, last_validation_loss)])
+                    if !isnothing(args.wandb_logger)
+                        Wandb.log(args.wandb_logger, Dict("train_loss" => l))
+                    end
+                else
+                    update!(pr, step + datapoint;
+                        showvalues = [(:step, "$(step + datapoint)/$(args.epochs*args.steps)"),
+                            (:loss, "acc norm stats..."), (:checkpoint, 0)])
                 end
-                next!(pr;
-                    showvalues = [
-                        (:train_step, "$(step + datapoint)/$(args.epochs*args.steps)"),
-                        (:train_loss, sum(losses)),
-                        (:checkpoint, length(df_train.step) > 0 ? last(df_train.step) : 0),
-                        (:data_interval, delta == 1 ? "1:end" : 1:delta),
-                        (:min_validation_loss, min_validation_loss),
-                        (:last_validation_loss, last_validation_loss)])
+            end
+
+            cp_progress += delta
+            step += delta
+            tmp_loss /= delta
+
+            avg_loss += tmp_loss
+            tmp_loss = 0.0f0
+
+            if step > args.norm_steps && cp_progress >= args.checkpoint
+                traj_idx = 1
+                valid_error = 0.0f0
+                pr_valid = Progress(ds_valid.meta["n_trajectories"];
+                    desc = "Validation progress: ", barlen = 50)
+
+                for data_valid in valid_loader
+                # for i in 1:dataset.meta["n_trajectories_valid"]
+                    # data_valid, meta_valid = next_trajectory!(
+                    #     dataset, device; types_noisy = args.types_noisy, is_training = false)
+                    prepare_trajectory!(data_valid, ds_valid.meta, device)
+
+                    mask = Int32.(findall(
+                        x -> x in args.types_updated, data_valid["node_type"][1, :, 1])) |>
+                        device
+                    node_type_valid, senders_valid, receivers_valid, edge_features_valid = create_base_graph(
+                        data_valid, ds_valid.meta["features"]["node_type"]["data_max"],
+                        ds_valid.meta["features"]["node_type"]["data_min"], device)
+                    val_mask_valid = Float32.(map(
+                        x -> x in args.types_updated, data_valid["node_type"][:, :, 1]))
+                    val_mask_valid = repeat(val_mask_valid,
+                        sum(size(data_valid[field], 1)
+                        for field in ds_valid.meta["target_features"]),
+                        1) |> device
+
+                    inflow_mask_valid = repeat(data_valid["node_type"][:, :, 1] .== 1,
+                        sum(size(data_valid[field], 1)
+                        for field in ds_valid.meta["target_features"]),
+                        1) |> device
+
+                    ve, g, p = validation_step(args.training_strategy,
+                        (
+                            mgn, data_valid, ds_valid.meta, delta, args.solver_valid,
+                            args.solver_valid_dt, fields, node_type_valid,
+                            edge_features_valid, senders_valid, receivers_valid, mask,
+                            val_mask_valid, inflow_mask_valid, data_valid
+                        ))
+
+                    valid_error += ve
+
+                    next!(pr_valid;
+                        showvalues = [
+                            (:trajectory, "$traj_idx/$(ds_valid.meta["n_trajectories"])"),
+                            (:valid_loss, "$(valid_error / traj_idx)")])
+                    traj_idx += 1
+                end
+
                 if !isnothing(args.wandb_logger)
-                    Wandb.log(args.wandb_logger, Dict("train_loss" => l))
-                end
-            else
-                next!(pr;
-                    showvalues = [(:step, "$(step + datapoint)/$(args.epochs*args.steps)"),
-                        (:loss, "acc norm stats..."), (:checkpoint, 0)])
-            end
-        end
-
-        cp_progress += delta
-        step += delta
-        tmp_loss /= delta
-
-        avg_loss += tmp_loss
-        tmp_loss = 0.0f0
-
-        if step > args.norm_steps && cp_progress >= args.checkpoint
-            valid_error = 0.0f0
-            gt = nothing
-            prediction = nothing
-            pr_valid = Progress(dataset.meta["n_trajectories_valid"];
-                desc = "Validation progress: ", barlen = 50)
-
-            for i in 1:dataset.meta["n_trajectories_valid"]
-                data_valid, meta_valid = next_trajectory!(
-                    dataset, device; types_noisy = args.types_noisy, is_training = false)
-
-                mask = Int32.(findall(
-                    x -> x in args.types_updated, data_valid["node_type"][1, :, 1])) |>
-                       device
-                node_type_valid, senders_valid, receivers_valid, edge_features_valid = create_base_graph(
-                    data_valid, meta_valid["features"]["node_type"]["data_max"],
-                    meta_valid["features"]["node_type"]["data_min"], device)
-                val_mask_valid = Float32.(map(
-                    x -> x in args.types_updated, data_valid["node_type"][:, :, 1]))
-                val_mask_valid = repeat(val_mask_valid,
-                    sum(size(data_valid[field], 1)
-                    for field in meta_valid["target_features"]),
-                    1) |> device
-
-                inflow_mask_valid = repeat(data_valid["node_type"][:, :, 1] .== 1,
-                    sum(size(data_valid[field], 1)
-                    for field in meta_valid["target_features"]),
-                    1) |> device
-
-                ve, g, p = validation_step(args.training_strategy,
-                    (
-                        mgn, data_valid, meta_valid, delta, args.solver_valid,
-                        args.solver_valid_dt, fields, node_type_valid,
-                        edge_features_valid, senders_valid, receivers_valid, mask,
-                        val_mask_valid, inflow_mask_valid, data_valid
-                    ))
-
-                valid_error += ve
-                if i == 1
-                    gt = g
-                    prediction = p
+                    Wandb.log(args.wandb_logger,
+                        Dict("validation_loss" => valid_error /
+                                                dataset.meta["n_trajectories"]))
                 end
 
-                next!(pr_valid;
-                    showvalues = [
-                        (:trajectory, "$i/$(meta_valid["n_trajectories_valid"])"),
-                        (:valid_loss, "$((valid_error + ve) / i)")])
+                if valid_error / dataset.meta["n_trajectories"] < min_validation_loss
+                    save!(mgn, opt_state, df_train, df_valid, step,
+                        valid_error / dataset.meta["n_trajectories"],
+                        joinpath(cp_path, "valid"); is_training = false)
+                    min_validation_loss = valid_error / dataset.meta["n_trajectories"]
+                    cp_progress = args.checkpoint
+                end
+                last_validation_loss = valid_error / dataset.meta["n_trajectories"]
             end
 
-            if !isnothing(args.wandb_logger)
-                Wandb.log(args.wandb_logger,
-                    Dict("validation_loss" => valid_error /
-                                              dataset.meta["n_trajectories_valid"]))
-            end
-
-            if valid_error / dataset.meta["n_trajectories_valid"] < min_validation_loss
+            if cp_progress >= args.checkpoint
                 save!(mgn, opt_state, df_train, df_valid, step,
-                    valid_error / dataset.meta["n_trajectories_valid"],
-                    joinpath(cp_path, "valid"); is_training = false)
-                min_validation_loss = valid_error / dataset.meta["n_trajectories_valid"]
-                cp_progress = args.checkpoint
+                    avg_loss / Float32(step / delta), cp_path)
+                avg_loss = 0.0f0
+                cp_progress = 0
             end
-            last_validation_loss = valid_error / dataset.meta["n_trajectories_valid"]
-        end
-
-        if cp_progress >= args.checkpoint
-            save!(mgn, opt_state, df_train, df_valid, step,
-                avg_loss / Float32(step / delta), cp_path)
-            avg_loss = 0.0f0
-            cp_progress = 0
         end
     end
 
@@ -519,19 +526,21 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
     end
 
     println("Loading evaluation data...")
-    dataset = load_dataset(ds_path, false)
+    ds_test = Dataset(:test, ds_path)
+    # dataset = load_dataset(ds_path, false)
 
     clear_log(1, false)
     @info "Evaluation data loaded!"
+    Threads.nthreads() < 2 && @warn "Julia is currently running on a single thread! Start Julia with more threads to speed up data loading."
 
     println("Building model...")
 
-    quantities, e_norms, n_norms, o_norms = calc_norms(dataset, device, args)
+    quantities, e_norms, n_norms, o_norms = calc_norms(ds_test, device, args)
 
-    dims = dataset.meta["dims"]
+    dims = ds_test.meta["dims"]
     outputs = 0
-    for tf in dataset.meta["target_features"]
-        outputs += dataset.meta["features"][tf]["dim"]
+    for tf in ds_test.meta["target_features"]
+        outputs += ds_test.meta["features"][tf]["dim"]
     end
 
     mgn, _, _, _ = load(
@@ -544,7 +553,7 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
     @info "Model built!"
 
     eval_network!(
-        solver, mgn, dataset, device, out_path, start, stop, dt, saves, mse_steps, args)
+        solver, mgn, ds_test, device, out_path, start, stop, dt, saves, mse_steps, args)
 end
 
 """
@@ -565,16 +574,19 @@ Initializes the network, performs evaluation for the given number of rollouts an
 - `mse_steps`: Time steps where the relative error is printed at.
 - `args`: Keyword arguments for configuring the evaluation.
 """
-function eval_network!(solver, mgn::GraphNetwork, dataset::Dataset, device::Function,
+function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, device::Function,
         out_path, start, stop, dt, saves, mse_steps, args::Args)
     local traj_ops = Dict{Tuple{Int, String}, Array{Float32, 3}}()
     local errors = Dict{Tuple{Int, String}, Array{Float32, 2}}()
     local timesteps = Dict{Tuple{Int, String}, Array{Float32, 1}}()
     local cells = Dict{Tuple{Int, String}, Array{Int32, 3}}()
 
-    for ti in 1:(args.num_rollouts)
-        println("Rollout trajectory $ti...")
-        data, meta = next_trajectory!(dataset, device; types_noisy = args.types_noisy)
+    test_loader = DataLoader(ds_test; batchsize = 0, buffer = true, parallel = true)
+
+    for (ti, data) in enumerate(test_loader)
+    # for ti in 1:(args.num_rollouts)
+        # data, meta = next_trajectory!(dataset, device; types_noisy = args.types_noisy)
+        prepare_trajectory!(data, ds_test.meta, device)
 
         initial_state = Dict{String, AbstractArray}(
             [typeof(v) <: AbstractArray ? (k, v[:, :, 1]) : (k, v) for (k, v) in data]
@@ -587,39 +599,39 @@ function eval_network!(solver, mgn::GraphNetwork, dataset::Dataset, device::Func
 
         val_mask = Float32.(map(x -> x in args.types_updated, data["node_type"][:, :, 1]))
         val_mask = repeat(
-            val_mask, sum(size(data[field], 1) for field in meta["target_features"]), 1) |>
+            val_mask, sum(size(data[field], 1) for field in ds_test.meta["target_features"]), 1) |>
                    device
 
         inflow_mask = repeat(data["node_type"][:, :, 1] .== 1,
-            sum(size(data[field], 1) for field in meta["target_features"]), 1) |> device
+            sum(size(data[field], 1) for field in ds_test.meta["target_features"]), 1) |> device
 
         node_type, senders, receivers, edge_features = create_base_graph(
-            data, meta["features"]["node_type"]["data_max"],
-            meta["features"]["node_type"]["data_min"], device)
+            data, ds_test.meta["features"]["node_type"]["data_max"],
+            ds_test.meta["features"]["node_type"]["data_min"], device)
 
-        fields = deleteat!(copy(dataset.meta["feature_names"]),
+        fields = deleteat!(copy(ds_test.meta["feature_names"]),
             findall(x -> x == "node_type" || x == "mesh_pos" || x == "cells",
-                dataset.meta["feature_names"]))
+                ds_test.meta["feature_names"]))
 
         target_dict = Dict{String, Int32}()
-        for tf in meta["target_features"]
-            target_dict[tf] = meta["features"][tf]["dim"]
+        for tf in ds_test.meta["target_features"]
+            target_dict[tf] = ds_test.meta["features"][tf]["dim"]
         end
 
+        pr = ProgressUnknown(; desc = "Trajectory $ti/$(length(test_loader)): ", showspeed = true)
+
         sol_u, sol_t = rollout(
-            solver, mgn, initial_state, fields, meta, dataset.meta["target_features"],
+            solver, mgn, initial_state, fields, ds_test.meta, ds_test.meta["target_features"],
             target_dict, node_type, edge_features, senders, receivers,
-            val_mask, inflow_mask, data, start, stop, dt, saves)
+            val_mask, inflow_mask, data, start, stop, dt, saves, pr)
 
         prediction = cat(sol_u...; dims = 3)
         error = mean(
             (prediction -
-             vcat([data[field][:, :, 1:length(saves)] for field in meta["target_features"]]...)) .^
+             vcat([data[field][:, :, 1:length(saves)] for field in ds_test.meta["target_features"]]...)) .^
             2;
             dims = 2)
         timesteps[(ti, "timesteps")] = sol_t
-
-        @info "Rollout trajectory $ti completed!"
 
         println("MSE of state prediction:")
         for horizon in mse_steps
@@ -630,7 +642,7 @@ function eval_network!(solver, mgn::GraphNetwork, dataset::Dataset, device::Func
 
         traj_ops[(ti, "mesh_pos")] = cpu_device()(data["mesh_pos"])
         traj_ops[(ti, "gt")] = cpu_device()(vcat([data[field]
-                                                  for field in meta["target_features"]]...))
+                                                  for field in ds_test.meta["target_features"]]...))
         traj_ops[(ti, "prediction")] = cpu_device()(prediction)
         errors[(ti, "error")] = cpu_device()(error[:, 1, :])
     end
