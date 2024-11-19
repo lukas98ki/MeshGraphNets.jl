@@ -109,7 +109,7 @@ Inner function for validation of a single trajectory.
 - Prediction data with `data_interval` as timesteps.
 """
 function _validation_step(t::Tuple, sim_interval, data_interval)
-    mgn, data, meta, _, solver, solver_dt, fields, node_type, edge_features, senders, receivers, mask, val_mask, inflow_mask, data = t
+    mgn, data, meta, _, solver, solver_dt, fields, node_type, edge_features, senders, receivers, mask, val_mask, inflow_mask, pr = t
 
     initial_state = Dict(
         [typeof(v) <: AbstractArray ? (k, v[:, :, 1]) : (k, v) for (k, v) in data]
@@ -125,7 +125,7 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     sol_u, _ = rollout(
         solver, mgn, initial_state, fields, meta, meta["target_features"], target_dict,
         node_type, edge_features, senders, receivers, val_mask, inflow_mask, data,
-        sim_interval[1], sim_interval[end], solver_dt, sim_interval)
+        sim_interval[1], sim_interval[end], solver_dt, sim_interval, pr)
     prediction = cat(sol_u...; dims = 3)[:, :, data_interval]
 
     error = mean((prediction - gt) .^ 2; dims = 3)
@@ -175,15 +175,15 @@ end
 function train_step(strategy::SolverStrategy, t::Tuple)
     mgn, data, inputs, fields, meta, target_fields, target_dict, node_type, edge_features, senders, receivers, val_mask, u0, gt = t
 
-    inflow_mask = repeat(data["node_type"][:, :, 1] .== 1,
-        sum(size(data[field], 1) for field in meta["target_features"]), 1) |> cpu_device()
+    # inflow_mask = repeat(data["node_type"][:, :, 1] .== 1,
+    #     sum(size(data[field], 1) for field in meta["target_features"]), 1) |> cpu_device()
 
     pr = ProgressUnknown(; desc = "Solver progress: ", showspeed = true)
     print("\n\n\n\n\n\n\n") # display solver progress after main progress
 
     ff = ODEFunction{false}((x, p, t) -> ode_func_train(x,
         (mgn, p, data, inputs, fields, meta, target_fields, target_dict, node_type,
-            edge_features, senders, receivers, val_mask, inflow_mask, strategy, pr),
+            edge_features, senders, receivers, val_mask, data["inflow_mask"], strategy, pr),
         t))
     prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), mgn.ps)
 

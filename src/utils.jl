@@ -54,12 +54,12 @@ function der_minmax(path, is_training)
     n_traj = dataset.meta["n_trajectories"]
 
     for _ in 1:n_traj
-        data, meta = next_trajectory!(
+        data, _ = next_trajectory!(
             dataset, cpu_device(); types_noisy = [], noise_stddevs = [], ts = nothing)
-        dt = Float32(meta["dt"][2] - meta["dt"][1])
         for tf in target_features
             for i in 2:size(data[tf], 3)
-                ddiff = (data[tf][:, :, i] - data[tf][:, :, i - 1]) ./ dt
+                ddiff = (data[tf][:, :, i] - data[tf][:, :, i - 1]) ./
+                        Float32(data["dt"][i] - data["dt"][i - 1])
                 ddiff_min = minimum(ddiff)
                 ddiff_max = maximum(ddiff)
                 if ddiff_min < result[tf][1]
@@ -73,14 +73,14 @@ function der_minmax(path, is_training)
     end
 
     if is_training
-        n_traj_valid = dataset.meta["n_trajectories_valid"]
+        n_traj_valid = dataset.meta["n_trajectories"]
         for _ in 1:n_traj_valid
             data, meta = next_trajectory!(dataset, cpu_device(); types_noisy = [],
                 noise_stddevs = [], ts = nothing, is_training = false)
-            dt = Float32(meta["dt"][2] - meta["dt"][1])
             for tf in target_features
                 for i in 2:size(data[tf], 3)
-                    ddiff = (data[tf][:, :, i] - data[tf][:, :, i - 1]) ./ dt
+                    ddiff = (data[tf][:, :, i] - data[tf][:, :, i - 1]) ./
+                            Float32(data["dt"][i] - data["dt"][i - 1])
                     ddiff_min = minimum(ddiff)
                     ddiff_max = maximum(ddiff)
                     if ddiff_min < result[tf][1]
@@ -136,6 +136,7 @@ Calculates the mean and standard deviation for each feature in the given part of
 ## Returns
 - Mean and standard deviation in the specified part of the dataset.
 """
+# TODO check if n_trajectories valid not needed
 function data_meanstd(path, is_training)
     dataset = load_dataset(path, is_training)
 
@@ -180,17 +181,17 @@ function data_meanstd(path, is_training)
             end
         end
 
-        dt = Float32(meta["dt"][2] - meta["dt"][1])
         for tf in target_features
             if isnumber(meta, tf)
                 result_arrays["target|$tf"] = cat(result_arrays["target|$tf"],
-                    (data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]) ./ dt; dims = 3)
+                    (data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]) ./
+                    Float32(data["dt"][2:end] - data["dt"][(i - 1):(end - 1)]); dims = 3)
             end
         end
     end
 
     if is_training
-        n_traj_valid = dataset.meta["n_trajectories_valid"]
+        n_traj_valid = dataset.meta["n_trajectories"]
         for _ in 1:n_traj_valid
             data, meta = next_trajectory!(dataset, cpu_device(); types_noisy = [],
                 noise_stddevs = [], ts = nothing, is_training = false)
@@ -201,11 +202,11 @@ function data_meanstd(path, is_training)
                 end
             end
 
-            dt = Float32(meta["dt"][2] - meta["dt"][1])
             for tf in target_features
                 if isnumber(meta, tf)
                     result_arrays["target|$tf"] = cat(result_arrays["target|$tf"],
-                        (data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]) ./ dt;
+                        (data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]) ./
+                        Float32(data["dt"][2:end] - data["dt"][(i - 1):(end - 1)]);
                         dims = 3)
                 end
             end
@@ -293,8 +294,7 @@ Deletes the content of the given number of lines in the terminal.
 """
 function clear_log(lines::Integer, move_up = true)
     if lines <= 0
-        throw(ArgumentError("""Expected positive number of lines to clear,
-                            got: lines == $lines"""))
+        throw(ArgumentError("Expected positive number of lines to clear, got: lines == $lines"))
     end
     clear_line(move_up)
     for _ in 1:lines

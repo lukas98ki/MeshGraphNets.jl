@@ -39,8 +39,7 @@ struct Dataset
     lock::ReentrantLock
 end
 
-
-function Dataset(datafile::String, metafile::String)
+function Dataset(datafile::String, metafile::String, args)
     if !isfile(datafile)
         throw(ArgumentError("Invalid datafile: $datafile"))
     elseif !endswith(datafile, ".jld2") || !endswith(datafile, ".h5")
@@ -56,11 +55,12 @@ function Dataset(datafile::String, metafile::String)
     keys_traj = keystraj(datafile)
     meta["n_trajectories"] = length(keys_traj)
     meta["keys_trajectories"] = keys_traj
+    merge!(meta, Dict(String(key) => getfield(args, key) for key in propertynames(args)))
 
     Dataset(meta, datafile, ReentrantLock())
 end
 
-function Dataset(split::Symbol, path::String)
+function Dataset(split::Symbol, path::String, args)
     if split != :train && split != :valid && split != :test
         throw(ArgumentError("Invalid symbol for dataset: $split. Possible values are [:train, :valid, :test]"))
     end
@@ -73,6 +73,7 @@ function Dataset(split::Symbol, path::String)
     keys_traj = keystraj(datafile)
     meta["n_trajectories"] = length(keys_traj)
     meta["keys_trajectories"] = keys_traj
+    merge!(meta, Dict(String(key) => getfield(args, key) for key in propertynames(args)))
 
     Dataset(meta, datafile, ReentrantLock())
 end
@@ -100,7 +101,6 @@ function keystraj(datafile::String)
     return keys_traj
 end
 
-
 MLUtils.numobs(ds::Dataset) = ds.meta["n_trajectories"]
 
 function MLUtils.getobs!(buffer, ds::Dataset, idx)
@@ -114,6 +114,26 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
         set_traj_data!(buffer, match_data, ds, fn)
     end
     set_edges!(buffer, ds, key)
+
+    prepare_trajectory!(buffer, ds.meta, ds.meta["device"])
+
+    buffer["mask"] = Int32.(findall(
+        x -> x in ds.meta["types_updated"], buffer["node_type"][1, :, 1])) |>
+                     ds.meta["device"]
+
+    buffer["val_mask"] = Float32.(map(
+        x -> x in ds.meta["types_updated"], buffer["node_type"][:, :, 1]))
+    buffer["val_mask"] = repeat(
+        buffer["val_mask"], sum(size(buffer[field], 1)
+        for field in ds.meta["target_features"]), 1) |>
+                         ds.meta["device"]
+
+    buffer["inflow_mask"] = repeat(buffer["node_type"][:, :, 1] .== 1,
+        sum(size(buffer[field], 1) for field in ds.meta["target_features"]), 1) |>
+                            ds.meta["device"]
+
+    create_base_graph!(buffer, ds.meta["features"]["node_type"]["data_max"],
+        ds.meta["features"]["node_type"]["data_min"], ds.meta["device"])
 
     return buffer
 end
@@ -135,11 +155,16 @@ function alloc_traj!(traj_dict::Dict{String, Any}, ds::Dataset, fn::String)
     else
         throw(ArgumentError("feature type of feature \"$fn\" must be static or dynamic"))
     end
-    traj_dict[fn] = zeros(
-        getfield(Base, Symbol(uppercasefirst(ds.meta["features"][fn]["dtype"]))),
-        dim, prod(ds.meta["dims"]), tl)
+    if !haskey(traj_dict, fn)
+        traj_dict[fn] = zeros(
+            getfield(Base, Symbol(uppercasefirst(ds.meta["features"][fn]["dtype"]))),
+            dim, prod(ds.meta["dims"]), tl)
+    end
     if haskey(ds.meta["features"][fn], "has_ev") && ds.meta["features"][fn]["has_ev"]
-        traj_dict[fn * ".ev"] = zeros(eltype(traj_dict[fn]), 2, prod(ds.meta["dims"]), tl)
+        if !haskey(traj_dict, fn * ".ev")
+            traj_dict[fn * ".ev"] = zeros(
+                eltype(traj_dict[fn]), 2, prod(ds.meta["dims"]), tl)
+        end
     end
 end
 
@@ -168,7 +193,7 @@ function match_keys!(traj_dict::Dict{String, Any}, ds::Dataset, key::String, fn:
             for m in matches
                 match_data[m] = traj[m]
                 if haskey(ds.meta["features"][fn], "has_ev") &&
-                    ds.meta["features"][fn]["has_ev"]
+                   ds.meta["features"][fn]["has_ev"]
                     match_data[m * ".ev"] = traj[m * ".ev"]
                 end
             end
@@ -182,7 +207,7 @@ function match_keys!(traj_dict::Dict{String, Any}, ds::Dataset, key::String, fn:
             for m in matches
                 match_data[m] = Base.read(traj, m)
                 if haskey(ds.meta["features"][fn], "has_ev") &&
-                    ds.meta["features"][fn]["has_ev"]
+                   ds.meta["features"][fn]["has_ev"]
                     match_data[m * ".ev"] = Base.read(traj, m * ".ev")
                 end
             end
@@ -264,15 +289,17 @@ function set_edges!(traj_dict::Dict{String, Any}, ds::Dataset, key::String)
 
             if haskey(ds.meta, "custom_edges")
                 edges = read_edges(file[key],
-                        ds.meta["custom_edges"],
-                        traj_dict["node_type"],
-                        haskey(ds.meta, "no_edges_node_types") ? ds.meta["no_edges_node_types"] :
-                        [],
-                        haskey(ds.meta, "exclude_node_indices") ?
-                        ds.meta["exclude_node_indices"] : [])
+                    ds.meta["custom_edges"],
+                    traj_dict["node_type"],
+                    haskey(ds.meta, "no_edges_node_types") ?
+                    ds.meta["no_edges_node_types"] :
+                    [],
+                    haskey(ds.meta, "exclude_node_indices") ?
+                    ds.meta["exclude_node_indices"] : [])
             elseif haskey(ds.meta, "dims")
                 edges = create_edges(ds.meta["dims"], traj_dict["node_type"],
-                    haskey(ds.meta, "no_edges_node_types") ? ds.meta["no_edges_node_types"] : [])
+                    haskey(ds.meta, "no_edges_node_types") ?
+                    ds.meta["no_edges_node_types"] : [])
             else
                 throw(ErrorException("No key for edges was provided in metafile. possible keys are [\"dims\", \"custom_edges\"]"))
             end
@@ -474,10 +501,12 @@ Transfers the data to the given device and configures the data if a derivative b
 - Transfered data.
 - Metadata of the dataset.
 """
-function prepare_trajectory!(data, meta, device::Function; types_noisy = nothing, noise_stddevs = nothing, ts = nothing)
-    if !isnothing(ts) && (typeof(ts) <: DerivativeStrategy)
+function prepare_trajectory!(data, meta, device::Function)
+    if !isnothing(meta["training_strategy"]) &&
+       (typeof(meta["training_strategy"]) <: DerivativeStrategy)
         add_targets!(data, meta["target_features"], device)
-        preprocess!(data, meta["target_features"], noise_stddevs, types_noisy, ts, device)
+        preprocess!(data, meta["target_features"], meta["noise_stddevs"],
+            meta["types_noisy"], meta["training_strategy"], device)
         for field in meta["feature_names"]
             if field == "mesh_pos" || field == "node_type" || field == "cells" ||
                field in meta["target_features"]
