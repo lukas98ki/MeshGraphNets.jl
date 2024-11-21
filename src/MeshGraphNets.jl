@@ -346,8 +346,6 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
         findall(x -> x == "node_type" || x == "mesh_pos" || x == "cells",
             ds_train.meta["feature_names"]))
 
-    delta = get_delta(args.training_strategy, ds_train.meta["trajectory_length"])
-
     train_tuple_additional = prepare_training(args.training_strategy)
 
     train_loader = DataLoader(
@@ -356,22 +354,7 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
 
     while step < args.steps
         for data in train_loader
-            # for _ in checkpoint:delta:(args.steps * args.epochs)
-            # prepare_trajectory!(data, ds_train.meta, device; types_noisy = args.types_noisy, noise_stddevs = noise, ts = args.training_strategy)
-            # # data, meta = next_trajectory!(dataset, device; types_noisy = args.types_noisy,
-            #     noise_stddevs = noise, ts = args.training_strategy)
-
-            # mask = Int32.(findall(x -> x in args.types_updated, data["node_type"][1, :, 1])) |>
-            #     device
-
-            # val_mask = Float32.(map(x -> x in args.types_updated, data["node_type"][:, :, 1]))
-            # val_mask = repeat(
-            #     val_mask, sum(size(data[field], 1) for field in ds_train.meta["target_features"]), 1) |>
-            #         device
-
-            # node_type, senders, receivers, edge_features = create_base_graph(
-            #     data, ds_train.meta["features"]["node_type"]["data_max"],
-            #     ds_train.meta["features"]["node_type"]["data_min"], device)
+            delta = get_delta(args.training_strategy, data["trajectory_length"])
 
             for datapoint in 1:delta
                 train_tuple = init_train_step(args.training_strategy,
@@ -425,29 +408,6 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                 print("\n\n\n\n\n\n\n")
 
                 for data_valid in valid_loader
-                    # for i in 1:dataset.meta["n_trajectories_valid"]
-                    # data_valid, meta_valid = next_trajectory!(
-                    #     dataset, device; types_noisy = args.types_noisy, is_training = false)
-                    # prepare_trajectory!(data_valid, ds_valid.meta, device)
-
-                    # mask = Int32.(findall(
-                    #     x -> x in args.types_updated, data_valid["node_type"][1, :, 1])) |>
-                    #        device
-                    # node_type_valid, senders_valid, receivers_valid, edge_features_valid = create_base_graph(
-                    #     data_valid, ds_valid.meta["features"]["node_type"]["data_max"],
-                    #     ds_valid.meta["features"]["node_type"]["data_min"], device)
-                    # val_mask_valid = Float32.(map(
-                    #     x -> x in args.types_updated, data_valid["node_type"][:, :, 1]))
-                    # val_mask_valid = repeat(val_mask_valid,
-                    #     sum(size(data_valid[field], 1)
-                    #     for field in ds_valid.meta["target_features"]),
-                    #     1) |> device
-
-                    # inflow_mask_valid = repeat(data_valid["node_type"][:, :, 1] .== 1,
-                    #     sum(size(data_valid[field], 1)
-                    #     for field in ds_valid.meta["target_features"]),
-                    #     1) |> device
-
                     print("\n\n\n")
                     pr_solver = ProgressUnknown(;
                         desc = "Trajectory $(traj_idx)/$(length(valid_loader)): ",
@@ -603,19 +563,6 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, device::Func
     test_loader = DataLoader(ds_test; batchsize = -1, buffer = false, parallel = true)
 
     for (ti, data) in enumerate(test_loader)
-        # for ti in 1:(args.num_rollouts)
-        # data, meta = next_trajectory!(dataset, device; types_noisy = args.types_noisy)
-        # prepare_trajectory!(data, ds_test.meta, device)
-
-        initial_state = Dict{String, AbstractArray}(
-            [typeof(v) <: AbstractArray ? (k, v[:, :, 1]) : (k, v) for (k, v) in data]
-        )
-        for k in keys(initial_state)
-            if endswith(k, ".ev")
-                delete!(initial_state, k)
-            end
-        end
-
         fields = deleteat!(copy(ds_test.meta["feature_names"]),
             findall(x -> x == "node_type" || x == "mesh_pos" || x == "cells",
                 ds_test.meta["feature_names"]))
@@ -629,9 +576,9 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, device::Func
             desc = "Trajectory $ti/$(args.num_rollouts): ", showspeed = true)
 
         sol_u, sol_t = rollout(
-            solver, mgn, initial_state, fields, ds_test.meta, ds_test.meta["target_features"],
+            solver, mgn, data, fields, ds_test.meta, ds_test.meta["target_features"],
             target_dict, data["node_type"], data["edge_features"], data["senders"],
-            data["receivers"], data["val_mask"], data["inflow_mask"], data, start, stop, dt,
+            data["receivers"], data["val_mask"], data["inflow_mask"], start, stop, dt,
             saves, pr)
 
         prediction = cat(sol_u...; dims = 3)

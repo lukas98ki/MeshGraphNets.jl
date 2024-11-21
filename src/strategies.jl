@@ -111,10 +111,6 @@ Inner function for validation of a single trajectory.
 function _validation_step(t::Tuple, sim_interval, data_interval)
     mgn, data, meta, _, solver, solver_dt, fields, node_type, edge_features, senders, receivers, mask, val_mask, inflow_mask, pr = t
 
-    initial_state = Dict(
-        [typeof(v) <: AbstractArray ? (k, v[:, :, 1]) : (k, v) for (k, v) in data]
-    )
-
     target_dict = Dict{String, Int32}()
     for tf in meta["target_features"]
         target_dict[tf] = meta["features"][tf]["dim"]
@@ -123,8 +119,8 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     gt = vcat([data[tf] for tf in meta["target_features"]]...)[:, :, data_interval]
 
     sol_u, _ = rollout(
-        solver, mgn, initial_state, fields, meta, meta["target_features"], target_dict,
-        node_type, edge_features, senders, receivers, val_mask, inflow_mask, data,
+        solver, mgn, data, fields, meta, meta["target_features"], target_dict,
+        node_type, edge_features, senders, receivers, val_mask, inflow_mask,
         sim_interval[1], sim_interval[end], solver_dt, sim_interval, pr)
     prediction = cat(sol_u...; dims = 3)[:, :, data_interval]
 
@@ -151,19 +147,10 @@ function init_train_step(::SolverStrategy, t::Tuple, ta::Tuple)
         target_dict[tf] = meta["features"][tf]["dim"]
     end
 
-    initial_state = Dict{String, AbstractArray}(
-        [typeof(v) <: AbstractArray ? (k, v[:, :, 1]) : (k, v) for (k, v) in data]
+    inputs = Dict{String, AbstractArray}(
+        [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1]) :
+         (field, data[field]) for field in fields]
     )
-    for k in keys(initial_state)
-        if endswith(k, ".ev")
-            delete!(initial_state, k)
-        end
-    end
-
-    inputs = deepcopy(initial_state)
-    for i in keys(target_dict)
-        delete!(inputs, "target|" * i)
-    end
 
     gt = vcat([data[tf] for tf in meta["target_features"]]...)
     u0 = gt[:, :, 1]

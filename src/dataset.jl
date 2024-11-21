@@ -106,6 +106,8 @@ MLUtils.numobs(ds::Dataset) = ds.meta["n_trajectories"]
 function MLUtils.getobs!(buffer, ds::Dataset, idx)
     key = ds.meta["keys_trajectories"][idx]
 
+    set_dt!(buffer, ds, key)
+
     for fn in ds.meta["feature_names"]
         alloc_traj!(buffer, ds, fn)
 
@@ -146,12 +148,36 @@ function MLUtils.getobs(ds::Dataset, idx)
     return traj_dict
 end
 
+function set_dt!(traj_dict::Dict{String, Any}, ds::Dataset, key::String)
+    local dt
+
+    lock(ds.lock) do
+        if endswith(ds.datafile, ".jld2")
+            file = jldopen(ds.datafile, "r")
+            traj = file[key]
+            dt = Float32.(file[key][ds.meta["dt"]])
+        else
+            file = h5open(ds.datafile, "r")
+            traj = open_group(file, key)
+            dt = Float32.(Base.read(traj, ds.meta["dt"]))
+        end
+        traj_dict["dt"] = dt
+        close(file)
+    end
+    if ds.meta["trajectory_length"] == -1
+        # trajectory length is inferred from dt of the trajectory
+        traj_dict["trajectory_length"] = length(dt)
+    else
+        traj_dict["trajectory_length"] = ds.meta["trajectory_length"]
+    end
+end
+
 function alloc_traj!(traj_dict::Dict{String, Any}, ds::Dataset, fn::String)
     dim = haskey(ds.meta["features"][fn], "dim") ? ds.meta["features"][fn]["dim"] : 1
     if ds.meta["features"][fn]["type"] == "static"
         tl = 1
     elseif ds.meta["features"][fn]["type"] == "dynamic"
-        tl = ds.meta["trajectory_length"]
+        tl = traj_dict["trajectory_length"]
     else
         throw(ArgumentError("feature type of feature \"$fn\" must be static or dynamic"))
     end
@@ -197,7 +223,6 @@ function match_keys!(traj_dict::Dict{String, Any}, ds::Dataset, key::String, fn:
                     match_data[m * ".ev"] = traj[m * ".ev"]
                 end
             end
-            dt = Float32.(file[key][ds.meta["dt"]])
         else
             file = h5open(ds.datafile, "r")
             traj = open_group(file, key)
@@ -211,9 +236,7 @@ function match_keys!(traj_dict::Dict{String, Any}, ds::Dataset, key::String, fn:
                     match_data[m * ".ev"] = Base.read(traj, m * ".ev")
                 end
             end
-            dt = Float32.(Base.read(traj, ds.meta["dt"]))
         end
-        traj_dict["dt"] = dt
         close(file)
     end
 
@@ -236,9 +259,9 @@ function set_traj_data!(traj_dict::Dict{String, Any}, match_data, ds::Dataset, f
             if ds.meta["features"][fn]["type"] == "dynamic"
                 if ndims(data) == 2
                     traj_dict[fn_k][coord, :, :] = data[
-                        coord, 1:ds.meta["trajectory_length"]]
+                        coord, 1:traj_dict["trajectory_length"]]
                 else
-                    traj_dict[fn_k][coord, :, :] = data[1:ds.meta["trajectory_length"]]
+                    traj_dict[fn_k][coord, :, :] = data[1:traj_dict["trajectory_length"]]
                 end
             else
                 traj_dict[fn_k][coord, :, :] .= data
@@ -258,10 +281,10 @@ function set_traj_data!(traj_dict::Dict{String, Any}, match_data, ds::Dataset, f
             if ds.meta["features"][fn]["type"] == "dynamic"
                 if ndims(data) == 2
                     traj_dict[fn_k][coord, dims_to_li(ds.meta["dims"], idx), :] = data[
-                        coord, 1:ds.meta["trajectory_length"]]
+                        coord, 1:traj_dict["trajectory_length"]]
                 else
                     traj_dict[fn_k][coord, dims_to_li(ds.meta["dims"], idx), :] = data[
-                        1:ds.meta["trajectory_length"]]
+                        1:traj_dict["trajectory_length"]]
                 end
             else
                 traj_dict[fn_k][coord, dims_to_li(ds.meta["dims"], idx), :] .= data
