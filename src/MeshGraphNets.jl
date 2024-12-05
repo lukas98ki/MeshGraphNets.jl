@@ -48,7 +48,7 @@ export train_network, eval_network, der_minmax, data_meanstd
     noise_stddevs::Vector{Float32} = [0.0f0]
     training_strategy::TrainingStrategy = DerivativeTraining()
     use_cuda::Bool = true
-    gpu_device::CuDevice = CUDA.device()
+    gpu_device::Union{Nothing, CuDevice} = CUDA.functional() ? CUDA.device() : nothing
     cell_idxs::Vector{Integer} = [0]
     num_rollouts::Integer = 10
     use_valid::Bool = true
@@ -88,10 +88,16 @@ function calc_norms(dataset, device, args::Args)
             e_norms = NormaliserOfflineMeanStd(Float32(dataset.meta["edges"]["data_mean"]),
                 Float32(dataset.meta["edges"]["data_std"]))
         else
-            throw(KeyError("Keyword \"edges\" was specified in metadata, but no normalization data was provided."))
+            e_norms = NormaliserOnline(
+                typeof(dataset.meta["dims"]) <: AbstractArray ?
+                length(dataset.meta["dims"]) + 1 : dataset.meta["dims"] + 1,
+                device)
         end
     else
-        e_norms = NormaliserOnline(length(dataset.meta["dims"]) + 1, device)
+        e_norms = NormaliserOnline(
+            typeof(dataset.meta["dims"]) <: AbstractArray ?
+            length(dataset.meta["dims"]) + 1 : dataset.meta["dims"] + 1,
+            device)
     end
 
     for feature in dataset.meta["feature_names"]

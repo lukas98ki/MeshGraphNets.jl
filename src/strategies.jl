@@ -257,12 +257,20 @@ function train_loss(strategy::SolverTraining, t::Tuple)
     local pred_n
 
     for i in eachindex(target_fields)
-        gt_n = vcat([n_norm[target_fields[i]](gt[
-                         (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
-                         :, 1:size(pred, 3)]) for i in eachindex(target_fields)]...)
-        pred_n = vcat([n_norm[target_fields[i]](pred[
-                           (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, :])
-                       for i in eachindex(target_fields)]...)
+        gt_n = vcat(
+            [cat(
+                 [n_norm[target_fields[i]](gt[
+                      (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+                  for ts in axes(pred, 3)]...; dims = 3
+             ) for i in eachindex(target_fields)]...
+        )
+        pred_n = vcat(
+            [cat(
+                 [n_norm[target_fields[i]](pred[
+                      (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+                  for ts in axes(pred, 3)]...; dims = 3
+             ) for i in eachindex(target_fields)]...
+        )
     end
 
     error = (gt_n[:, :, 1:size(pred, 3)] .- pred_n) .^ 2 |> cpu_device()
@@ -384,20 +392,13 @@ end
 function init_train_step(::DerivativeStrategy, t::Tuple, ::Tuple)
     mgn, data, meta, fields, target_fields, node_type, edge_features, senders, receivers, datapoint, mask, _ = t
 
-    if typeof(data["dt"]) <: AbstractArray
-        target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
-                                             :, :, datapoint] -
-                                                            data[field][:, :, datapoint]) /
-                                                           (data["dt"][datapoint + 1] -
-                                                            data["dt"][datapoint]))
-                                         for field in target_fields]...)
-    else
-        target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
-                                             :, :, datapoint] -
-                                                            data[field][:, :, datapoint]) /
-                                                           Float32(data["dt"]))
-                                         for field in target_fields]...)
-    end
+    target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
+                                         :, :, datapoint] -
+                                                        data[field][:, :, datapoint]) /
+                                                       (data["dt"][datapoint + 1] -
+                                                        data["dt"][datapoint]))
+                                     for field in target_fields]...)
+
     graph = build_graph(
         mgn, data, fields, datapoint, node_type, edge_features, senders, receivers)
 
