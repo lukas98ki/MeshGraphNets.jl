@@ -40,9 +40,9 @@ opt = Adam(learning_rate)
 # Paths to data folders #
 #########################
 
-ds_path = "data/CylinderFlow/datasets"
-chk_path = "data/CylinderFlow/chk"
-eval_path = "data/CylinderFlow/eval"
+ds_path = "../data/CylinderFlow/data"
+chk_path = "../data/CylinderFlow/chk"
+eval_path = "../data/CylinderFlow/eval"
 
 #################
 # Train network #
@@ -51,23 +51,21 @@ eval_path = "data/CylinderFlow/eval"
 # with DerivativeTraining
 
 train_network(
-    noise, opt, ds_path, chk_path; mps = message_steps, layer_size = layer_size,
+    opt, ds_path, chk_path; mps = message_steps, layer_size = layer_size,
     hidden_layers = hidden_layers, batchsize = batch,
     epochs = epo, steps = Int(ns), use_cuda = cuda, checkpoint = cp,
     norm_steps = 1000, types_updated = types_updated,
-    types_noisy = types_noisy, training_strategy = DerivativeTraining(),
-    solver_valid = Euler(), solver_valid_dt = 0.01f0
+    types_noisy = types_noisy, training_strategy = DerivativeTraining()
 )
 
 # with SolverTraining
 
 train_network(
-    noise, opt, ds_path, chk_path; mps = message_steps, layer_size = layer_size,
+    opt, ds_path, chk_path; mps = message_steps, layer_size = layer_size,
     hidden_layers = hidden_layers, batchsize = batch, epochs = epo,
     steps = Int(ns), use_cuda = cuda, checkpoint = 10, norm_steps = 1000,
     types_updated = types_updated, types_noisy = types_noisy,
-    training_strategy = SolverTraining(
-        0.0f0, 0.01f0, 5.99f0, Euler(); adaptive = false, tstops = 0.0f0:0.01f0:5.99f0)
+    training_strategy = SolverTraining(0.0f0, 0.01f0, 5.99f0, Tsit5())
 )
 
 ####################
