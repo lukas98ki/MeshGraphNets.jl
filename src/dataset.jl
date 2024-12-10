@@ -245,7 +245,7 @@ function set_meta!(traj_dict::Dict{String, Any}, ds::Dataset, key::String)
         else
             throw(ArgumentError("The metadata \"dims\" is specified as Integer but no metadata \"n_nodes\" was provided. The number of nodes can only be inferred from a vector of dimensions. Either provide the number of nodes or use a vector of static dimensions."))
         end
-    elseif typeof(dims) <: AbstractArray{Integer}
+    elseif typeof(dims) <: AbstractArray && all(x -> typeof(x) <: Integer, dims)
         if any(x -> x == -1, dims)
             if haskey(ds.meta, "n_nodes")
                 n_nodes = ds.meta["n_nodes"]
@@ -356,7 +356,7 @@ function match_keys!(traj_dict::Dict{String, Any}, ds::Dataset, key::String, fn:
         else
             file = h5open(ds.datafile, "r")
             traj = open_group(file, key)
-            rx_match = match.(rx, keys(traj))
+            rx_match = eachmatch.(rx, keys(traj))
             deleteat!(rx_match, findall(x -> length(collect(x)) == 0, rx_match))
             matches = unique(getfield.(collect.(rx_match)[1], :match))
             for m in matches
@@ -436,27 +436,41 @@ function set_edges!(traj_dict::Dict{String, Any}, ds::Dataset, key::String)
         end
 
         if haskey(ds.meta, "edges")
-            edge_type = ds.meta["edges"]["type"]
-            if edge_type == "cells"
-                edge_key = ds.meta["edges"]["key"]
-                if endswith(ds.datafile, ".jld2")
-                    traj_dict["cells"] = file[key][edge_key]
+            if haskey(ds.meta["edges"], "type")
+                edge_type = ds.meta["edges"]["type"]
+                if edge_type == "cells"
+                    if !haskey(ds.meta["edges"], "key")
+                        throw(ArgumentError("The metadata \"type\" for metadata \"edges\" was defined as \"cells\", but no metadata \"key\" for the datafile was given."))
+                    end
+                    edge_key = ds.meta["edges"]["key"]
+                    if endswith(ds.datafile, ".jld2")
+                        traj_dict["cells"] = file[key][edge_key]
+                    else
+                        traj_dict["cells"] = Base.read(traj, edge_key)
+                    end
+                elseif edge_type == "dims"
+                    traj_dict["edges"] = hcat(sort(create_edges(
+                        traj_dict["dims"], traj_dict["node_type"],
+                        haskey(ds.meta, "no_edges_node_types") ?
+                        ds.meta["no_edges_node_types"] : []))...)
+                elseif edge_type == "custom"
+                    if !haskey(ds.meta["edges"], "key")
+                        throw(ArgumentError("The metadata \"type\" for metadata \"edges\" was defined as \"cells\", but no metadata \"key\" for the datafile was given."))
+                    end
+                    traj_dict["edges"] = hcat(sort(read_edges(file[key],
+                        ds.meta["edges"]["key"], traj_dict["node_type"],
+                        haskey(ds.meta, "no_edges_node_types") ?
+                        ds.meta["no_edges_node_types"] : [],
+                        haskey(ds.meta, "exclude_node_indices") ?
+                        ds.meta["exclude_node_indices"] : []))...)
                 else
-                    traj_dict["cells"] = Base.read(traj, edge_key)
+                    throw(ArgumentError("The metadata \"type\" of metadata \"edges\" is invalid. Possible values are: [\"cells\" for cell-type edge structures, \"dims\" for fixed edges along the dimensions, \"custom\" for custom edges]"))
                 end
-            elseif edge_type == "dims"
-                traj_dict["edges"] = hcat(sort(create_edges(
-                    traj_dict["dims"], traj_dict["node_type"],
-                    haskey(ds.meta, "no_edges_node_types") ?
-                    ds.meta["no_edges_node_types"] : []))...)
-            elseif edge_type == "custom"
-                traj_dict["edges"] = hcat(sort(read_edges(file[key],
-                    ds.meta["custom_edges"], traj_dict["node_type"],
-                    haskey(ds.meta, "no_edges_node_types") ?
-                    ds.meta["no_edges_node_types"] : [],
-                    haskey(ds.meta, "exclude_node_indices") ?
-                    ds.meta["exclude_node_indices"] : []))...)
+            else
+                throw(ArgumentError("The metadata \"edges\" does not specify an edge type with the metadata \"type\"."))
             end
+        else
+            throw(ArgumentError("The metadata \"edges\" was not provided."))
         end
         close(file)
     end

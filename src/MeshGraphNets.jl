@@ -50,7 +50,6 @@ export train_network, eval_network, der_minmax, data_meanstd
     use_cuda::Bool = true
     gpu_device::Union{Nothing, CuDevice} = CUDA.functional() ? CUDA.device() : nothing
     cell_idxs::Vector{Integer} = [0]
-    num_rollouts::Integer = 10
     use_valid::Bool = true
     solver_valid::OrdinaryDiffEqAlgorithm = Tsit5()
     solver_valid_dt::Union{Nothing, Float32} = nothing
@@ -274,7 +273,13 @@ function train_network(opt, ds_path, cp_path; kws...)
     println("Loading training data...")
     ds_train = Dataset(:train, ds_path, args)
     ds_train.meta["device"] = device
+    ds_train.meta["types_updated"] = args.types_updated
+    ds_train.meta["types_noisy"] = args.types_noisy
+    ds_train.meta["noise_stddevs"] = args.noise_stddevs
     ds_valid = Dataset(:valid, ds_path, args)
+    ds_valid.meta["types_updated"] = args.types_updated
+    ds_valid.meta["types_noisy"] = args.types_noisy
+    ds_valid.meta["noise_stddevs"] = args.noise_stddevs
     ds_valid.meta["device"] = device
     clear_log(1, false)
     @info "Training data loaded!"
@@ -490,7 +495,6 @@ Starts the evaluation process with the given configuration.
 - `types_updated = [0, 5]`: Array containing node types which are updated after each step.
 - `use_cuda = true`: Whether a GPU is used for training or not (if available). Currently only CUDA GPUs are supported.
 - `gpu_device = CUDA.device()`: Current CUDA device (aka GPU). See *nvidia-smi* for reference.
-- `num_rollouts = 10`: Number of trajectories that are simulated (from the test dataset).
 - `use_valid = true`: Whether the last checkpoint with the minimal validation loss should be used.
 """
 function eval_network(ds_path, cp_path::String, out_path::String, solver = nothing;
@@ -579,7 +583,7 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, device::Func
         end
 
         pr = ProgressUnknown(;
-            desc = "Trajectory $ti/$(args.num_rollouts): ", showspeed = true)
+            desc = "Trajectory $ti/$(length(test_loader)): ", showspeed = true)
 
         sol_u, sol_t = rollout(
             solver, mgn, data, fields, ds_test.meta, ds_test.meta["target_features"],
