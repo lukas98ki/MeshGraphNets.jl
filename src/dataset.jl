@@ -10,7 +10,7 @@ import Random: MersenneTwister
 import HDF5: read_dataset
 import JLD2: jldopen
 import JSON: parse
-import Random: seed!, make_seed, shuffle
+import Random: seed!, shuffle
 
 include("strategies.jl")
 
@@ -631,8 +631,7 @@ function preprocess!(data, noise_fields, noise_stddevs, types_noisy, ts, device)
         data[nf] += noise
     end
 
-    seed = make_seed(1234)
-    rng = MersenneTwister(seed)
+    rng = MersenneTwister(1234)
 
     for key in keys(data)
         if key == "edges" || length(data[key]) == 1 || size(data[key])[end] == 1
@@ -645,7 +644,7 @@ function preprocess!(data, noise_fields, noise_stddevs, types_noisy, ts, device)
                         ts.window_size == 0 ? collect(1:end) : collect(1:(ts.window_size)))]
             end
         end
-        seed!(rng, seed)
+        seed!(rng, 1234)
     end
 end
 
