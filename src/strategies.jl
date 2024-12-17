@@ -109,11 +109,7 @@ Inner function for validation of a single trajectory.
 - Prediction data with `data_interval` as timesteps.
 """
 function _validation_step(t::Tuple, sim_interval, data_interval)
-    mgn, data, meta, _, solver, solver_dt, fields, node_type, edge_features, senders, receivers, mask, val_mask, inflow_mask, data = t
-
-    initial_state = Dict(
-        [typeof(v) <: AbstractArray ? (k, v[:, :, 1]) : (k, v) for (k, v) in data]
-    )
+    mgn, data, meta, _, solver, solver_dt, fields, node_type, edge_features, senders, receivers, mask, val_mask, inflow_mask, pr = t
 
     target_dict = Dict{String, Int32}()
     for tf in meta["target_features"]
@@ -123,9 +119,9 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     gt = vcat([data[tf] for tf in meta["target_features"]]...)[:, :, data_interval]
 
     sol_u, _ = rollout(
-        solver, mgn, initial_state, fields, meta, meta["target_features"], target_dict,
-        node_type, edge_features, senders, receivers, val_mask, inflow_mask, data,
-        sim_interval[1], sim_interval[end], solver_dt, sim_interval; show_progress = false)
+        solver, mgn, data, fields, meta, meta["target_features"], target_dict,
+        node_type, edge_features, senders, receivers, val_mask, inflow_mask,
+        sim_interval[1], sim_interval[end], solver_dt, sim_interval, pr)
     prediction = cat(sol_u...; dims = 3)[:, :, data_interval]
 
     error = mean((prediction - gt) .^ 2; dims = 3)
@@ -151,19 +147,10 @@ function init_train_step(::SolverStrategy, t::Tuple, ta::Tuple)
         target_dict[tf] = meta["features"][tf]["dim"]
     end
 
-    initial_state = Dict{String, AbstractArray}(
-        [typeof(v) <: AbstractArray ? (k, v[:, :, 1]) : (k, v) for (k, v) in data]
+    inputs = Dict{String, AbstractArray}(
+        [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1]) :
+         (field, data[field]) for field in fields]
     )
-    for k in keys(initial_state)
-        if endswith(k, ".ev")
-            delete!(initial_state, k)
-        end
-    end
-
-    inputs = deepcopy(initial_state)
-    for i in keys(target_dict)
-        delete!(inputs, "target|" * i)
-    end
 
     gt = vcat([data[tf] for tf in meta["target_features"]]...)
     u0 = gt[:, :, 1]
@@ -175,14 +162,15 @@ end
 function train_step(strategy::SolverStrategy, t::Tuple)
     mgn, data, inputs, fields, meta, target_fields, target_dict, node_type, edge_features, senders, receivers, val_mask, u0, gt = t
 
-    inflow_mask = repeat(data["node_type"][:, :, 1] .== 1,
-        sum(size(data[field], 1) for field in meta["target_features"]), 1) |> cpu_device()
+    # inflow_mask = repeat(data["node_type"][:, :, 1] .== 1,
+    #     sum(size(data[field], 1) for field in meta["target_features"]), 1) |> cpu_device()
 
-    pr = ProgressUnknown(; showspeed = true)
+    pr = ProgressUnknown(; desc = "Solver progress: ", showspeed = true)
+    print("\n\n\n\n\n\n\n") # display solver progress after main progress
 
     ff = ODEFunction{false}((x, p, t) -> ode_func_train(x,
         (mgn, p, data, inputs, fields, meta, target_fields, target_dict, node_type,
-            edge_features, senders, receivers, val_mask, inflow_mask, strategy, pr),
+            edge_features, senders, receivers, val_mask, data["inflow_mask"], strategy, pr),
         t))
     prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), mgn.ps)
 
@@ -192,6 +180,8 @@ function train_step(strategy::SolverStrategy, t::Tuple)
                 [meta["features"][tf]["dim"] for tf in target_fields])),
         mgn.ps)
     shoot_gs = back(one(shoot_loss))
+
+    clear_log(7, false)
     return shoot_gs, shoot_loss
 end
 
@@ -208,8 +198,7 @@ Inner function for a solver based training step that calculates the loss based o
 - Calculated loss.
 """
 function train_loss(strategy::SolverStrategy, ::Tuple)
-    throw(ArgumentError("""Unknown solver based training strategy: $strategy.
-                        See [documentation](https://una-auxme.github.io/MeshGraphNets.jl/dev/strategies/) for available solver strategies."""))
+    throw(ArgumentError("Unknown solver based training strategy: $strategy. See [documentation](https://una-auxme.github.io/MeshGraphNets.jl/dev/strategies/) for available solver strategies."))
 end
 
 function validation_step(strategy::SolverStrategy, t::Tuple)
@@ -268,12 +257,20 @@ function train_loss(strategy::SolverTraining, t::Tuple)
     local pred_n
 
     for i in eachindex(target_fields)
-        gt_n = vcat([n_norm[target_fields[i]](gt[
-                         (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
-                         :, 1:size(pred, 3)]) for i in eachindex(target_fields)]...)
-        pred_n = vcat([n_norm[target_fields[i]](pred[
-                           (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, :])
-                       for i in eachindex(target_fields)]...)
+        gt_n = vcat(
+            [cat(
+                 [n_norm[target_fields[i]](gt[
+                      (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+                  for ts in axes(pred, 3)]...; dims = 3
+             ) for i in eachindex(target_fields)]...
+        )
+        pred_n = vcat(
+            [cat(
+                 [n_norm[target_fields[i]](pred[
+                      (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+                  for ts in axes(pred, 3)]...; dims = 3
+             ) for i in eachindex(target_fields)]...
+        )
     end
 
     error = (gt_n[:, :, 1:size(pred, 3)] .- pred_n) .^ 2 |> cpu_device()
@@ -395,20 +392,13 @@ end
 function init_train_step(::DerivativeStrategy, t::Tuple, ::Tuple)
     mgn, data, meta, fields, target_fields, node_type, edge_features, senders, receivers, datapoint, mask, _ = t
 
-    if typeof(meta["dt"]) <: AbstractArray
-        target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
-                                             :, :, datapoint] -
-                                                            data[field][:, :, datapoint]) /
-                                                           (meta["dt"][datapoint + 1] -
-                                                            meta["dt"][datapoint]))
-                                         for field in target_fields]...)
-    else
-        target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
-                                             :, :, datapoint] -
-                                                            data[field][:, :, datapoint]) /
-                                                           Float32(meta["dt"]))
-                                         for field in target_fields]...)
-    end
+    target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
+                                         :, :, datapoint] -
+                                                        data[field][:, :, datapoint]) /
+                                                       (data["dt"][datapoint + 1] -
+                                                        data["dt"][datapoint]))
+                                     for field in target_fields]...)
+
     graph = build_graph(
         mgn, data, fields, datapoint, node_type, edge_features, senders, receivers)
 
