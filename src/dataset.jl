@@ -101,22 +101,30 @@ function get_file(split::Symbol, path::String)
 end
 
 function keystraj(datafile::String)
+    keys_traj = nothing
+
     if endswith(datafile, ".jld2")
-        file = jldopen(datafile, "r")
+        keys_traj = jldopen(datafile, "r") do file
+            return keys(file)
+        end
     elseif endswith(datafile, ".h5")
-        file = h5open(datafile, "r")
+        keys_traj = h5open(datafile, "r") do file
+            return keys(file["/"])  # Je nach Struktur evtl. ohne ["/"]
+        end
     end
-    keys_traj = keys(file)
-    close(file)
+
+    if isnothing(keys_traj)
+        error("Unsupported file format or file extension: $datafile")
+    end
 
     return keys_traj
 end
 
+
 MLUtils.numobs(ds::Dataset) = ds.meta["n_trajectories"]
 
 function MLUtils.getobs!(buffer, ds::Dataset, idx)
-    key = ds.meta["keys_trajectories"][idx]
-
+    key = ds.meta["keys_trajectories"][idx]     # key = trajectory_xx
     set_meta!(buffer, ds, key)
 
     for fn in ds.meta["feature_names"]
@@ -127,6 +135,8 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
         set_traj_data!(buffer, match_data, ds, fn)
     end
     set_edges!(buffer, ds, key)
+
+    set_edge_features!(buffer, ds, key)
 
     prepare_trajectory!(buffer, ds.meta, ds.meta["device"])
 
@@ -507,6 +517,8 @@ function set_edges!(traj_dict::Dict{String, Any}, ds::Dataset, key::String)
     end
 end
 
+
+
 """
     create_edges(dims, node_type, excluded_node_types)
 
@@ -617,7 +629,7 @@ end
 Parses the edges that were read from the datafile. The format is a vector of pairs of node indices that represent edges.
 
 ## Arguments
-- `edges`: Vector of pairs of node indices.
+- `edges`: Vector of pairs of node indices. (not nx2-matrix, but really n pairs)
 - `node_type`: Array of node types from the datafile.
 - `excluded_node_types`: Vector of node types that should not be connected with edges.
 - `exclude_node_indices`: Vector of node indices that should not be connected with edges.
@@ -626,6 +638,9 @@ Parses the edges that were read from the datafile. The format is a vector of pai
 - Two-dimensional array of edges as pairs of node indices.
 """
 function parse_custom_edges(edges, node_type, no_edges_node_types, exclude_node_indices)
+    if edges isa Matrix{Int64}
+        edges = collect(eachrow(edges))  # Umwandeln in Vector von Arrays
+    end    
     exclude_indices = findall(x -> x ∈ no_edges_node_types, node_type)
     exclude_indices = vcat(exclude_indices, exclude_node_indices)
     filtered_edges = filter(x -> x[1] ∉ exclude_indices && x[2] ∉ exclude_indices, edges)
@@ -633,7 +648,6 @@ function parse_custom_edges(edges, node_type, no_edges_node_types, exclude_node_
     for edge in filtered_edges
         push!(edge_vec, [edge[1], edge[2]])
     end
-
     return hcat(sort(edge_vec)...)
 end
 
@@ -754,3 +768,50 @@ function prepare_trajectory!(data, meta, device::Function)
     end
     return data, meta
 end
+
+
+
+"""
+    set_edge_features!(buffer, ds, key)
+
+Liest die Edge Features aus der Datenstruktur und speichert sie im `buffer`.
+
+## Arguments
+- `buffer`: Speicher für die Trajektoriedaten.
+- `ds`: Dataset mit den Metadaten.
+- `key`: Name der aktuellen Trajektorie.
+"""
+function set_edge_features!(buffer, ds::Dataset, key::String)
+    if haskey(ds.meta, "edge_features")
+        for edge_feature in ds.meta["edge_features"]
+            if haskey(buffer, edge_feature)
+                continue
+            end
+
+            lock(ds.lock) do
+                if endswith(ds.datafile, ".jld2")
+                    jldopen(ds.datafile, "r") do file
+                        traj = file[key]
+                        if haskey(traj, edge_feature)
+                            buffer["edge|" * edge_feature] = traj[edge_feature]
+                        else
+                            println("Edge Feature $edge_feature fehlt, Standardwerte werden genutzt.")
+                            buffer["edge|" * edge_feature] = ones(Float32, size(buffer["edges"], 2), 1)
+                        end
+                    end
+                else
+                    h5open(ds.datafile, "r") do file
+                        traj = open_group(file, key)
+                        if haskey(traj, edge_feature)
+                            buffer[edge_feature] = Base.read(traj, edge_feature)
+                        else
+                            println("Edge Feature $edge_feature fehlt, Standardwerte werden genutzt.")
+                            buffer[edge_feature] = ones(Float32, size(buffer["edges"], 2), 1)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+

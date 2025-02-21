@@ -138,10 +138,17 @@ Calculates the mean and standard deviation for each feature in the given part of
 """
 # TODO check if n_trajectories valid not needed
 function data_meanstd(path, is_training)
-    dataset = load_dataset(path, is_training)
+    # dataset = load_dataset(path, is_training)
+    args = Args()
+    dataset = Dataset(:train, path, args)
+    dataset.meta["device"] = cpu_device()
+    dataset.meta["types_updated"] = args.types_updated
+    dataset.meta["types_noisy"] = args.types_noisy
+    dataset.meta["noise_stddevs"] = args.noise_stddevs
 
     features = dataset.meta["feature_names"]
     target_features = dataset.meta["target_features"]
+    edge_features = dataset.meta["edge_features"]
 
     result = Dict(f => [0.0f0, 0.0f0] for f in features)
     for tf in target_features
@@ -161,21 +168,30 @@ function data_meanstd(path, is_training)
     for f in features
         if isnumber(dataset.meta, f)
             result_arrays[f] = zeros(
-                Float32, dataset.meta["features"][f]["dim"], prod(dataset.meta["dims"]), 0)
+                Float32, dataset.meta["features"][f]["dim"], 26, 0)
         end
     end
     for tf in target_features
         if isnumber(dataset.meta, tf)
             result_arrays["target|$tf"] = zeros(
-                Float32, dataset.meta["features"][tf]["dim"], prod(dataset.meta["dims"]), 0)
+                Float32, dataset.meta["features"][tf]["dim"], 26, 0)
+        end
+    end
+    for ef in edge_features
+        if isnumber(dataset.meta, ef)
+            result_arrays[ef] = zeros(Float32, dataset.meta["features"][ef]["dim"], 676, 0)
         end
     end
 
-    for _ in 1:n_traj
-        data, meta = next_trajectory!(
-            dataset, cpu_device(); types_noisy = [], noise_stddevs = [], ts = nothing)
-
+    # for _ in 1:n_traj
+    train_loader = DataLoader(dataset; batchsize = -1, buffer = false, parallel = true, shuffle = true)
+    for (i, data) in enumerate(train_loader)
+        # data, meta = next_trajectory!(dataset, cpu_device(); types_noisy = [], noise_stddevs = [], ts = nothing)
+        meta = dataset.meta
         for f in features
+            if f == "node_type"
+                continue
+            end
             if isnumber(meta, f)
                 result_arrays[f] = cat(result_arrays[f], data[f]; dims = 3)
             end
@@ -185,29 +201,57 @@ function data_meanstd(path, is_training)
             if isnumber(meta, tf)
                 result_arrays["target|$tf"] = cat(result_arrays["target|$tf"],
                     (data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]) ./
-                    Float32(data["dt"][2:end] - data["dt"][(i - 1):(end - 1)]); dims = 3)
+                    Float32(dataset.meta["dt"]); dims = 3)
+            end
+        end
+
+        for ef in edge_features
+            if isnumber(meta, ef)
+                if ndims(data[ef]) == 1
+                    data[ef] = reshape(data[ef], 1, size(data[ef], 1), 1)  # → (1, 676, 1)
+                elseif ndims(data[ef]) == 2
+                    data[ef] = reshape(data[ef], 1, size(data[ef], 2), size(data[ef], 1)) # Sicherstellen, dass es (1, 676, T) ist
+                end
+                
+                result_arrays[ef] = cat(result_arrays[ef], data[ef]; dims = 3)
             end
         end
     end
 
     if is_training
+        train_loader = DataLoader(dataset; batchsize = -1, buffer = false, parallel = true, shuffle = true)
         n_traj_valid = dataset.meta["n_trajectories"]
-        for _ in 1:n_traj_valid
-            data, meta = next_trajectory!(dataset, cpu_device(); types_noisy = [],
-                noise_stddevs = [], ts = nothing, is_training = false)
+        # for _ in 1:n_traj_valid
+        for data in train_loader
+            # data, meta = next_trajectory!(dataset, cpu_device(); types_noisy = [],
+            #     noise_stddevs = [], ts = nothing, is_training = false)
 
             for f in features
-                if isnumber(meta, f)
+                if f == "node_type"
+                    continue
+                end
+                if isnumber(dataset.meta, f)
                     result_arrays[f] = cat(result_arrays[f], data[f]; dims = 3)
                 end
             end
 
             for tf in target_features
-                if isnumber(meta, tf)
+                if isnumber(dataset.meta, tf)
                     result_arrays["target|$tf"] = cat(result_arrays["target|$tf"],
                         (data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]) ./
-                        Float32(data["dt"][2:end] - data["dt"][(i - 1):(end - 1)]);
+                        Float32(dataset.meta["dt"]);
                         dims = 3)
+                end
+            end
+
+            for ef in edge_features
+                if isnumber(dataset.meta, ef)
+                    if ndims(data[ef]) == 1
+                        data[ef] = reshape(data[ef], 1, size(data[ef], 1), 1)  # → (1, 676, 1)
+                    elseif ndims(data[ef]) == 2
+                        data[ef] = reshape(data[ef], 1, size(data[ef], 2), size(data[ef], 1)) # Sicherstellen, dass es (1, 676, T) ist
+                    end
+                    result_arrays[ef] = cat(result_arrays[ef], data[ef]; dims = 3)
                 end
             end
         end

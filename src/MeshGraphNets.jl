@@ -11,7 +11,6 @@ using CUDA
 using Lux, LuxCUDA
 using MLUtils
 using Optimisers
-using Wandb
 using Zygote
 
 import OrdinaryDiffEq: OrdinaryDiffEqAlgorithm, Tsit5
@@ -53,7 +52,7 @@ export train_network, eval_network, der_minmax, data_meanstd
     use_valid::Bool = true
     solver_valid::OrdinaryDiffEqAlgorithm = Tsit5()
     solver_valid_dt::Union{Nothing, Float32} = nothing
-    wandb_logger::Union{Nothing, Wandb.WandbLogger} = nothing
+    wandb_logger = nothing
     reset_valid::Bool = false
 end
 
@@ -76,8 +75,17 @@ function calc_norms(dataset, device, args::Args)
     quantities = 0
     n_norms = Dict{String, Union{NormaliserOffline, NormaliserOnline}}()
     o_norms = Dict{String, Union{NormaliserOffline, NormaliserOnline}}()
+    e_norms = Dict{String, Union{NormaliserOffline, NormaliserOnline}}()
 
-    if haskey(dataset.meta, "edges")
+    # Todo: Added the possiblity of having edge_features; if having those, edges will be ignored. Currently only one edge_features possible, and only data_mean offline
+    if haskey(dataset.meta, "edge_features")
+        for ef in dataset.meta["edge_features"]
+            if haskey(dataset.meta["features"][ef], "data_mean") && haskey(dataset.meta["features"][ef], "data_std")
+                e_norms = NormaliserOfflineMeanStd(Float32(dataset.meta["features"][ef]["data_mean"]), Float32(dataset.meta["features"][ef]["data_std"]))
+            end
+        end
+    elseif haskey(dataset.meta, "edges")
+        println("Sind doch bei edges drin :( ")
         if haskey(dataset.meta["edges"], "data_min") &&
            haskey(dataset.meta["edges"], "data_max")
             e_norms = NormaliserOfflineMinMax(Float32(dataset.meta["edges"]["data_min"]),
@@ -290,16 +298,33 @@ function train_network(opt, ds_path, cp_path; kws...)
 
     println("Building model...")
 
-    quantities, e_norms, n_norms, o_norms = calc_norms(ds_train, device, args)
+    nf_size, e_norms, n_norms, o_norms = calc_norms(ds_train, device, args)
+    ef_size = 0
+    # Check if edge_features are used. If yes, use these dimensions, if not -> dims of mesh_pos
+    if haskey(ds_train.meta, "edge_features")
+        if length(ds_train.meta["edge_features"]) != 0
+            for ef in ds_train.meta["edge_features"]
+                ef_size += ds_train.meta["features"][ef]["dim"]
+            end
+        else 
+            println("Edge_feature bracket is empty! Using mesh_pos!")
+            dims = typeof(dims) <: AbstractArray ? length(dims) : dims
+            ef_size = dims + 1    
+        end
+    else
+        dims = typeof(dims) <: AbstractArray ? length(dims) : dims
+        ef_size = dims + 1 
+    end
 
-    dims = ds_train.meta["dims"]
+    println("Ef_size is: ", ef_size)
+
     outputs = 0
     for tf in ds_train.meta["target_features"]
         outputs += ds_train.meta["features"][tf]["dim"]
     end
 
     mgn, opt_state, df_train, df_valid = load(
-        quantities, typeof(dims) <: AbstractArray ? length(dims) : dims,
+        nf_size, ef_size,
         e_norms, n_norms, o_norms, outputs, args.mps,
         args.layer_size, args.hidden_layers, opt, device, cp_path)
 
@@ -361,13 +386,15 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
     train_tuple_additional = prepare_training(args.training_strategy)
 
     train_loader = DataLoader(
-        ds_train; batchsize = -1, buffer = false, parallel = true, shuffle = true)
-    valid_loader = DataLoader(ds_valid; batchsize = -1, buffer = false, parallel = true)
+        ds_train; batchsize = -1, buffer = false, parallel = false, shuffle = true)
+    valid_loader = DataLoader(ds_valid; batchsize = -1, buffer = false, parallel = false)
 
     while step < args.steps
         for data in train_loader
+            if step > args.steps
+                break
+            end
             delta = get_delta(args.training_strategy, data["trajectory_length"])
-
             for datapoint in 1:delta
                 train_tuple = init_train_step(args.training_strategy,
                     (mgn, data, ds_train.meta, fields,
@@ -394,9 +421,9 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                             (:data_interval, delta == 1 ? "1:end" : 1:delta),
                             (:min_validation_loss, min_validation_loss),
                             (:last_validation_loss, last_validation_loss)])
-                    if !isnothing(args.wandb_logger)
-                        Wandb.log(args.wandb_logger, Dict("train_loss" => sum(losses)))
-                    end
+                    # if !isnothing(args.wandb_logger)
+                    #     Wandb.log(args.wandb_logger, Dict("train_loss" => sum(losses)))
+                    # end
                 else
                     update!(pr, step + datapoint;
                         showvalues = [
@@ -444,12 +471,12 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                 end
                 clear_log(9)
 
-                if !isnothing(args.wandb_logger)
-                    Wandb.log(args.wandb_logger,
-                        Dict("validation_loss" => valid_error /
-                                                  ds_valid.meta["n_trajectories"]))
-                end
-
+                # if !isnothing(args.wandb_logger)
+                #     Wandb.log(args.wandb_logger,
+                #         Dict("validation_loss" => valid_error /
+                #                                   ds_valid.meta["n_trajectories"]))
+                # end
+                println("Validation Error: ", valid_error / ds_valid.meta["n_trajectories"])
                 if valid_error / ds_valid.meta["n_trajectories"] < min_validation_loss
                     save!(mgn, opt_state, df_train, df_valid, step,
                         valid_error / ds_valid.meta["n_trajectories"],
@@ -460,7 +487,7 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                 last_validation_loss = valid_error / ds_valid.meta["n_trajectories"]
             end
 
-            if cp_progress >= args.checkpoint
+            if cp_progress >= args.checkpoint || step + delta >= args.steps
                 save!(mgn, opt_state, df_train, df_valid, step,
                     avg_loss / Float32(step / delta), cp_path)
                 avg_loss = 0.0f0
@@ -525,16 +552,31 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
 
     println("Building model...")
 
-    quantities, e_norms, n_norms, o_norms = calc_norms(ds_test, device, args)
+    nf_size, e_norms, n_norms, o_norms = calc_norms(ds_test, device, args)
+    ef_size = 0
+    # Check if edge_features are used. If yes, use these dimensions, if not -> dims of mesh_pos
+    if haskey(ds_test.meta, "edge_features")
+        if length(ds_test.meta["edge_features"]) != 0
+            for ef in ds_test.meta["edge_features"]
+                ef_size += ds_test.meta["features"][ef]["dim"]
+            end
+        else 
+            println("Edge_feature bracket is empty! Using mesh_pos!")
+            dims = typeof(dims) <: AbstractArray ? length(dims) : dims
+            ef_size = dims + 1    
+        end
+    else
+        dims = typeof(dims) <: AbstractArray ? length(dims) : dims
+        ef_size = dims + 1 
+    end
 
-    dims = ds_test.meta["dims"]
     outputs = 0
     for tf in ds_test.meta["target_features"]
         outputs += ds_test.meta["features"][tf]["dim"]
     end
 
     mgn, _, _, _ = load(
-        quantities, typeof(dims) <: AbstractArray ? length(dims) : dims, e_norms,
+        nf_size, ef_size, e_norms,
         n_norms, o_norms, outputs, args.mps, args.layer_size, args.hidden_layers,
         nothing, device, args.use_valid ? joinpath(cp_path, "valid") : cp_path)
     Lux.testmode(mgn.st)
@@ -569,7 +611,7 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
     local timesteps = Dict{Tuple{Int, String}, Array{Float32, 1}}()
     local cells = Dict{Tuple{Int, String}, Array{Int32, 3}}()
 
-    test_loader = DataLoader(ds_test; batchsize = -1, buffer = false, parallel = true)
+    test_loader = DataLoader(ds_test; batchsize = -1, buffer = false, parallel = false)
 
     for (ti, data) in enumerate(test_loader)
         fields = deleteat!(copy(ds_test.meta["feature_names"]),

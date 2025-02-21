@@ -26,7 +26,22 @@ function create_base_graph!(data, type_size, type_min, device::Function)
     node_type = one_hot(
         vec(data["node_type"][:, :, 1]), type_size - type_min + 1, 1 - type_min)
 
-    if haskey(data, "cells")
+    edge_feature_keys = filter(k -> startswith(k, "edge|"), keys(data)) # get edge_feature_keys (those starting with edge|)
+
+    if length(edge_feature_keys) > 0 
+        if length(edge_feature_keys) > 1
+            error("More than one edge key found: $(edge_feature_keys). Not yet implemented for more than one.")
+        elseif length(edge_feature_keys) == 1
+            senders, receivers = parse_custom_edges_features(data)
+            edge_feature_key = first(edge_feature_keys)
+            edge_features = data[edge_feature_key]  # Todo: sollte doppelt gemoppelt sein. Überprüfen
+            # println("size ef: ", size(edge_features))
+            # println("tpye ", typeof(edge_features))
+        else
+            println("Something went wrong with number of edges?")
+        end
+
+    elseif haskey(data, "cells")
         senders, receivers = triangles_to_edges(data["cells"][:, :, 1])
         if 0 in senders || 0 in receivers
             senders .+= 1
@@ -42,15 +57,15 @@ function create_base_graph!(data, type_size, type_min, device::Function)
         end
         rel_vec = [data["mesh_pos"][:, senders[i], 1] -
                    data["mesh_pos"][:, receivers[i], 1] for i in eachindex(senders)]
+        relative_mesh_pos = hcat(rel_vec...)
+        edge_features = vcat(relative_mesh_pos, permutedims(map(norm, eachcol(relative_mesh_pos))))
+        println("size ef: ", size(edge_features))
+        println("tpye ", typeof(edge_features))
+
     else
         throw(KeyError("Data does not contain cell or edge information!"))
     end
-
-    relative_mesh_pos = hcat(rel_vec...)
-
-    edge_features = vcat(
-        relative_mesh_pos, permutedims(map(norm, eachcol(relative_mesh_pos))))
-
+    
     data["node_type"] = device(node_type)
     data["senders"] = device(senders)
     data["receivers"] = device(receivers)
@@ -69,7 +84,7 @@ Constructs a [FeatureGraph](@ref) based on the given arguments.
 - `fields`: Node features of the MGN.
 - `datapoint`: Current index of the data corresponding to the current timestep.
 - `node_type`: Onehot vector of the node types used for node features.
-- `edge_features`: Array of edge features for each edge in the graph.
+- `edge_features`: Array of edge features for each edge in the graph. (mesh_pos expects: edge_features::AbstractArray{Float32, 2})
 - `senders`: Vector of indices where each edge in the graph starts.
 - `receivers`: Vector of indices where each edge in the graph ends.
 
@@ -77,7 +92,7 @@ Constructs a [FeatureGraph](@ref) based on the given arguments.
 - Resulting [FeatureGraph](@ref).
 """
 function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer, node_type,
-        edge_features::AbstractArray{Float32, 2}, senders::AbstractArray{T, 1},
+        edge_features, senders::AbstractArray{T, 1},
         receivers::AbstractArray{T, 1}) where {T <: Integer}
     # Removed generator in favor of removing Zygote.jl piracies (minimal increase of time and allocations)
     # Can be reverted once Enzyme.jl is compatible
