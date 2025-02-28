@@ -140,7 +140,7 @@ function get_delta(::SolverStrategy, ::Integer)
 end
 
 function init_train_step(::SolverStrategy, t::Tuple, ta::Tuple)
-    mgn, data, meta, fields, target_fields, node_type, edge_features, senders, receivers, _, _, val_mask = t
+    mgn, data, meta, fields, target_fields, node_type, edge_features, senders, receivers, _, idx_mask, val_mask = t
 
     target_dict = Dict{String, Int32}()
     for tf in meta["target_features"]
@@ -156,18 +156,12 @@ function init_train_step(::SolverStrategy, t::Tuple, ta::Tuple)
     u0 = gt[:, :, 1]
 
     return (mgn, data, inputs, fields, meta, target_fields, target_dict,
-        node_type, edge_features, senders, receivers, val_mask, u0, gt)
+        node_type, edge_features, senders, receivers, idx_mask, val_mask, u0, gt)
 end
 
 function train_step(strategy::SolverStrategy, t::Tuple)
-    mgn, data, inputs, fields, meta, target_fields, target_dict, node_type, edge_features, senders, receivers, val_mask, u0, gt = t
-
-    # inflow_mask = repeat(data["node_type"][:, :, 1] .== 1,
-    #     sum(size(data[field], 1) for field in meta["target_features"]), 1) |> cpu_device()
-
+    mgn, data, inputs, fields, meta, target_fields, target_dict, node_type, edge_features, senders, receivers, idx_mask, val_mask, u0, gt = t
     pr = ProgressUnknown(; desc = "Solver progress: ", showspeed = true)
-    print("\n\n\n\n\n\n\n") # display solver progress after main progress
-
     re = nothing
     if typeof(mgn.model) <: Flux.Chain
         mgn.ps, re = Flux.destructure(mgn.model)
@@ -178,15 +172,13 @@ function train_step(strategy::SolverStrategy, t::Tuple)
             target_fields, target_dict, node_type,
             edge_features, senders, receivers, val_mask, data["inflow_mask"], strategy, pr),
         t))
-    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), mgn.ps)
 
+    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), mgn.ps)
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps -> train_loss(strategy,
-            (prob, ps, u0, nothing, gt, val_mask, mgn.n_norm, target_fields,
+            (prob, ps, u0, nothing, gt, idx_mask, val_mask, mgn.n_norm, target_fields,
                 [meta["features"][tf]["dim"] for tf in target_fields])),
         mgn.ps)
-
-    clear_log(7, false)
     return shoot_gs, shoot_loss
 end
 
@@ -249,7 +241,7 @@ function SolverTraining(tstart::Float32,
 end
 
 function train_loss(strategy::SolverTraining, t::Tuple)
-    prob, ps, u0, callback_solve, gt, val_mask, n_norm, target_fields, target_dims = t
+    prob, ps, u0, callback_solve, gt, idx_mask, val_mask, n_norm, target_fields, target_dims = t
 
     sol = solve(remake(prob; p = ps), strategy.solver; u0 = u0,
         saveat = (strategy.tstart):(strategy.dt):(strategy.tstop),
@@ -258,39 +250,42 @@ function train_loss(strategy::SolverTraining, t::Tuple)
 
     pred = typeof(gt) <: CuArray ? CuArray(sol) : Array(sol)
 
-    local gt_n
-    local pred_n
+    error = (gt[:, idx_mask, 1:size(pred, 3)] .- pred) .^ 2
+    return mean(error)
 
-    for i in eachindex(target_fields)
-        gt_n = vcat(
-            [cat(
-                 [n_norm[target_fields[i]](gt[
-                      (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
-                  for ts in axes(pred, 3)]...; dims = 3
-             ) for i in eachindex(target_fields)]...
-        )
-        pred_n = vcat(
-            [cat(
-                 [n_norm[target_fields[i]](pred[
-                      (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
-                  for ts in axes(pred, 3)]...; dims = 3
-             ) for i in eachindex(target_fields)]...
-        )
-    end
+    # local gt_n
+    # local pred_n
 
-    error = (gt_n[:, :, 1:size(pred, 3)] .- pred_n) .^ 2 |> cpu_device()
+    # for i in eachindex(target_fields)
+    #     gt_n = vcat(
+    #         [cat(
+    #              [n_norm[target_fields[i]](gt[
+    #                   (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+    #               for ts in axes(pred, 3)]...; dims = 3
+    #          ) for i in eachindex(target_fields)]...
+    #     )
+    #     pred_n = vcat(
+    #         [cat(
+    #              [n_norm[target_fields[i]](pred[
+    #                   (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+    #               for ts in axes(pred, 3)]...; dims = 3
+    #          ) for i in eachindex(target_fields)]...
+    #     )
+    # end
 
-    err_buf = Zygote.Buffer(error)
+    # error = (gt_n[:, :, 1:size(pred, 3)] .- pred_n) .^ 2 |> cpu_device()
 
-    vm = cpu_device()(val_mask)
+    # err_buf = Zygote.Buffer(error)
 
-    err_buf[:, :, :] = error
-    for i in axes(err_buf, 3)
-        err_buf[:, :, i] = err_buf[:, :, i] .* vm
-    end
-    loss = mean(copy(err_buf))
+    # vm = cpu_device()(val_mask)
 
-    return loss
+    # err_buf[:, :, :] = error
+    # for i in axes(err_buf, 3)
+    #     err_buf[:, :, i] = err_buf[:, :, i] .* vm
+    # end
+    # loss = mean(copy(err_buf))
+
+    # return loss
 end
 
 """
@@ -397,11 +392,16 @@ end
 function init_train_step(::DerivativeStrategy, t::Tuple, ::Tuple)
     mgn, data, meta, fields, target_fields, node_type, edge_features, senders, receivers, datapoint, mask, _ = t
 
-    target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
-                                         :, :, datapoint] -
-                                                        data[field][:, :, datapoint]) /
-                                                       (data["dt"][datapoint + 1] -
-                                                        data["dt"][datapoint]))
+    # target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
+    #                                      :, :, datapoint] -
+    #                                                     data[field][:, :, datapoint]) /
+    #                                                    (data["dt"][datapoint + 1] -
+    #                                                     data["dt"][datapoint]))
+    #                                  for field in target_fields]...)
+
+    target_quantities_change = vcat([(data["target|" * field][:, :, datapoint] -
+                                      data[field][:, :, datapoint]) /
+                                     (data["dt"][datapoint + 1] - data["dt"][datapoint])
                                      for field in target_fields]...)
 
     graph = build_graph(

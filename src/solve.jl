@@ -207,20 +207,22 @@ function ode_step(x,
         output = re(ps)(graph)
     end
 
-    indices = [meta["features"][tf]["dim"] for tf in target_fields]
+    return output .* val_mask
 
-    buf = Zygote.Buffer(output)
-    for i in eachindex(target_fields)
-        buf[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :] = inverse_data(
-            mgn.o_norm[target_fields[i]],
-            output[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :])
-    end
+    # indices = [meta["features"][tf]["dim"] for tf in target_fields]
 
-    @ignore_derivatives begin
-        if !isnothing(pr)
-            next!(pr; showvalues = [(:t, "$(t)")])
-        end
-    end
+    # buf = Zygote.Buffer(output)
+    # for i in eachindex(target_fields)
+    #     buf[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :] = inverse_data(
+    #         mgn.o_norm[target_fields[i]],
+    #         output[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :])
+    # end
 
-    return copy(buf) .* val_mask
+    # @ignore_derivatives begin
+    #     if !isnothing(pr)
+    #         next!(pr; showvalues = [(:t, "$(t)")])
+    #     end
+    # end
+
+    # return copy(buf) .* val_mask
 end

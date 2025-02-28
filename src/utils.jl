@@ -50,6 +50,7 @@ function data_minmax(path)
 
     features = ds_train.meta["feature_names"]
     target_features = ds_train.meta["target_features"]
+    edge_features = ds_train.meta["edge_features"]
 
     result = Dict{String, Vector{Float32}}()
     for f in features
@@ -60,6 +61,11 @@ function data_minmax(path)
     for tf in target_features
         if !haskey(ds_train.meta["features"][tf], "onehot") && isnumber(ds_train.meta, tf)
             result["target|$tf"] = [Inf32, -Inf32]
+        end
+    end
+    for ef in edge_features
+        if !haskey(ds_train.meta["features"][ef], "onehot") && isnumber(ds_train.meta, ef)
+            result[ef] = [Inf32, -Inf32]
         end
     end
 
@@ -76,21 +82,36 @@ function data_minmax(path)
                 end
             end
         end
+        for ef in edge_features
+            if !haskey(ds_train.meta["features"][ef], "onehot") && isnumber(ds_train.meta, ef)
+                data_min = minimum(data["edge|$ef"])
+                data_max = maximum(data["edge|$ef"])
+                if data_min < result[ef][1]
+                    result[ef][1] = data_min
+                end
+                if data_max > result[ef][2]
+                    result[ef][2] = data_max
+                end
+            end
+        end
 
         for tf in target_features
-            if !haskey(ds_train.meta["features"][tf], "onehot") &&
-               isnumber(ds_train.meta, tf)
+            if !haskey(ds_train.meta["features"][tf], "onehot") && isnumber(ds_train.meta, tf)
                 ddiff = data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]
                 dts = Float32.(data["dt"][2:end] - data["dt"][1:(end - 1)])
                 for i in eachindex(dts)
-                    ddiff[:, :, i] ./= dts[i]
+                    if dts[i] != 0
+                        ddiff[:, :, i] ./= dts[i]
+                    else
+                        ddiff[:, :, i] .= 0  # Vermeidung von Inf / NaN
+                    end
                 end
-                ddiff_min = minimum(ddiff)
-                ddiff_max = maximum(ddiff)
+                ddiff_min = minimum(filter(x -> isfinite(x), ddiff))
+                ddiff_max = maximum(filter(x -> isfinite(x), ddiff))
                 if ddiff_min < result["target|$tf"][1]
                     result["target|$tf"][1] = ddiff_min
                 end
-                if ddiff_max > result[tf][2]
+                if ddiff_max > result["target|$tf"][2]
                     result["target|$tf"][2] = ddiff_max
                 end
             end

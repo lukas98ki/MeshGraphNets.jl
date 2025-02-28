@@ -96,12 +96,18 @@ function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer, node_t
         receivers::AbstractArray{T, 1}) where {T <: Integer}
     # Removed generator in favor of removing Zygote.jl piracies (minimal increase of time and allocations)
     # Can be reverted once Enzyme.jl is compatible
-    nt = mgn.n_norm["node_type"](node_type)
+    #nt = mgn.n_norm["node_type"](node_type)
+    nt = node_type
     nf = similar(nt, 0, size(nt, 2))
+    # for field in fields
+    #     nf = vcat(
+    #         nf, mgn.n_norm[field](data[field][:, :, min(size(data[field], 3), datapoint)]))
+    # end
     for field in fields
-        nf = vcat(
-            nf, mgn.n_norm[field](data[field][:, :, min(size(data[field], 3), datapoint)]))
+        nf = vcat(nf, (data[field][:, :, min(size(data[field], 3), datapoint)]))
     end
+    
+
     nf = vcat(nf, nt)
     return FeatureGraph(
         nf,
@@ -109,7 +115,7 @@ function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer, node_t
         #     [mgn.n_norm[field](data[field][:, :, min(size(data[field], 3), datapoint)]) for field in fields]...,
         #     mgn.n_norm["node_type"](node_type)
         # ),
-        mgn.e_norm(edge_features),
+        edge_features,
         senders,
         receivers
     )

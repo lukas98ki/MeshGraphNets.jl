@@ -79,11 +79,23 @@ function calc_norms(dataset, device, args::Args)
     o_norms = Dict{String, Union{NormaliserOffline, NormaliserOnline}}()
     e_norms = Dict{String, Union{NormaliserOffline, NormaliserOnline}}()
 
-    # Todo: Added the possiblity of having edge_features; if having those, edges will be ignored. Currently only one edge_features possible, and only data_mean offline
+    # Todo: Add possiblity of multiple edge_features. also currently only edge_feature or mesh_pos edge feature possible
     if haskey(dataset.meta, "edge_features")
         for ef in dataset.meta["edge_features"]
-            if haskey(dataset.meta["features"][ef], "data_mean") && haskey(dataset.meta["features"][ef], "data_std")
-                e_norms = NormaliserOfflineMeanStd(Float32(dataset.meta["features"][ef]["data_mean"]), Float32(dataset.meta["features"][ef]["data_std"]))
+            if haskey(dataset.meta["features"][ef], "data_mean") &&
+               haskey(dataset.meta["features"][ef], "data_std")
+                e_norms = NormaliserOfflineMeanStd(
+                    Float32(dataset.meta["features"][ef]["data_mean"]),
+                    Float32(dataset.meta["features"][ef]["data_std"]))
+            elseif haskey(dataset.meta["edges"], "data_min") &&
+                   haskey(dataset.meta["edges"], "data_max")
+                e_norms = NormaliserOfflineMinMax(
+                    Float32(dataset.meta["features"][ef]["data_min"]),
+                    Float32(dataset.meta["features"][ef]["data_max"]))
+            else
+                e_norms = NormaliserOnline(
+                    dataset.meta["features"][ef]["dim"],
+                    device; max_acc = Float32(args.max_norm_steps))
             end
         end
     elseif haskey(dataset.meta, "edges")
@@ -318,14 +330,14 @@ function train_network(opt, ds_path, cp_path; kws...)
             for ef in ds_train.meta["edge_features"]
                 ef_size += ds_train.meta["features"][ef]["dim"]
             end
-        else 
+        else
             println("Edge_feature bracket is empty! Using mesh_pos!")
             dims = typeof(dims) <: AbstractArray ? length(dims) : dims
-            ef_size = dims + 1    
+            ef_size = dims + 1
         end
     else
         dims = typeof(dims) <: AbstractArray ? length(dims) : dims
-        ef_size = dims + 1 
+        ef_size = dims + 1
     end
 
     println("Ef_size is: ", ef_size)
@@ -334,12 +346,12 @@ function train_network(opt, ds_path, cp_path; kws...)
     for tf in ds_train.meta["target_features"]
         outputs += ds_train.meta["features"][tf]["dim"]
     end
-
-    mgn, opt_state, df_train, df_valid = load(
+    println("Check before load")
+    mgn, opt_state, df_train, df_valid = GraphNetCore.load_(
         nf_size, ef_size,
         e_norms, n_norms, o_norms, outputs, args.mps,
         args.layer_size, args.hidden_layers, opt, device, cp_path, ml_module)
-
+    println("After load")
     if isnothing(opt_state)
         if args.backend == :Lux
             opt_state = Optimisers.setup(opt, mgn.ps)
@@ -598,26 +610,27 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
             for ef in ds_test.meta["edge_features"]
                 ef_size += ds_test.meta["features"][ef]["dim"]
             end
-        else 
+        else
             println("Edge_feature bracket is empty! Using mesh_pos!")
             dims = typeof(dims) <: AbstractArray ? length(dims) : dims
-            ef_size = dims + 1    
+            ef_size = dims + 1
         end
     else
         dims = typeof(dims) <: AbstractArray ? length(dims) : dims
-        ef_size = dims + 1 
+        ef_size = dims + 1
     end
 
     outputs = 0
     for tf in ds_test.meta["target_features"]
         outputs += ds_test.meta["features"][tf]["dim"]
     end
-
-    mgn, _, _, _ = load(
+    println("Pre eval load")
+    mgn, _, _, _ = load_(
         nf_size, ef_size, e_norms,
         n_norms, o_norms, outputs, args.mps, args.layer_size, args.hidden_layers,
         nothing, device, args.use_valid ? joinpath(cp_path, "valid") : cp_path, ml_module)
 
+    println("MGN.model ist: ", typeof(mgn.model))
     if typeof(mgn.model) <: Lux.Chain
         Lux.testmode(mgn.st)
     elseif typeof(mgn.model) <: Flux.Chain
@@ -698,7 +711,6 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
         errors[(ti, "error")] = cpu_device()(error[:, 1, :])
         edges[(ti, "edges")] = cpu_device()(permutedims(hcat(
             data["senders"], data["receivers"])))
-        break
     end
 
     eval_path = joinpath(out_path,
