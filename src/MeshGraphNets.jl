@@ -13,6 +13,7 @@ using Lux, LuxCUDA
 using MLUtils
 using Optimisers
 using Zygote
+using Infiltrator
 
 import OrdinaryDiffEq: OrdinaryDiffEqAlgorithm, Tsit5
 import ProgressMeter: Progress
@@ -262,7 +263,7 @@ Starts the training process with the given configuration.
 - `use_cuda = true`: Whether a GPU is used for training or not (if available). Currently only CUDA GPUs are supported.
 - `gpu_device = CUDA.device()`: Current CUDA device (aka GPU). See *nvidia-smi* for reference.
 - `cell_idxs = [0]`: Indices of cells that are plotted during validation (if enabled).
-- `use_valid = true`: Whether the last checkpoint of validation should be used, last training checkpoint otherwise.
+- `use_valid = true`: Whether the last checkpoint of validation should be used, last training checkpoint otherwise in evaluation.
 - `solver_valid = Tsit5()`: Which solver should be used for validation during training.
 - `solver_valid_dt = nothing`: If set, the solver for validation will use fixed timesteps.
 - `wandb_logger` = nothing: If set, a [Wandb](https://github.com/avik-pal/Wandb.jl) WandbLogger will be used for logging the training.
@@ -340,18 +341,15 @@ function train_network(opt, ds_path, cp_path; kws...)
         ef_size = dims + 1
     end
 
-    println("Ef_size is: ", ef_size)
-
+    nf_size = nf_size + 4   # Todo: Garbage coding! done because we serialize 4 extra timesteps es input_features
     outputs = 0
     for tf in ds_train.meta["target_features"]
         outputs += ds_train.meta["features"][tf]["dim"]
     end
-    println("Check before load")
     mgn, opt_state, df_train, df_valid = GraphNetCore.load_(
         nf_size, ef_size,
         e_norms, n_norms, o_norms, outputs, args.mps,
         args.layer_size, args.hidden_layers, opt, device, cp_path, ml_module)
-    println("After load")
     if isnothing(opt_state)
         if args.backend == :Lux
             opt_state = Optimisers.setup(opt, mgn.ps)
@@ -426,8 +424,11 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
             if step > args.steps
                 break
             end
-            delta = get_delta(args.training_strategy, data["trajectory_length"])
-            for datapoint in 1:delta
+            delta = get_delta(args.training_strategy, data["trajectory_length"])    # derivative = length; solver = 1
+            if args.training_strategy isa SolverStrategy    # Todo: Add variable that checks if multiple previous timesteps should be considered, than do this
+                delta = 5   # Todo: hardcoded, instead variable
+            end
+            for datapoint in 5:delta    # Number of watch back states Todo: Make it a function variable; Delta is 1 in solver case  # old default: 1:delta
                 train_tuple = init_train_step(args.training_strategy,
                     (mgn, data, ds_train.meta, fields,
                         ds_train.meta["target_features"], data["node_type"],
@@ -436,11 +437,16 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                     train_tuple_additional)
 
                 gs, losses = train_step(args.training_strategy, train_tuple)
-
                 tmp_loss += sum(losses)
 
                 if step + datapoint > args.norm_steps
                     for i in eachindex(gs)
+                        # g = gs[i]
+                        # avg_g = mean(abs, g)
+                        # min_g = minimum(abs.(g))
+                        # max_g = maximum(abs.(g))
+                        # println("Gradients (i=$i): avg = $avg_g | min = $min_g | max = $max_g")
+
                         if args.backend == :Lux || args.training_strategy isa SolverStrategy
                             opt_state, ps = Optimisers.update(opt_state, mgn.ps, gs[i])
                             mgn.ps = ps
@@ -511,7 +517,7 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                             (:valid_loss, "$(valid_error / traj_idx)")])
                     traj_idx += 1
                 end
-                clear_log(9)
+                clear_log(4)
 
                 # if !isnothing(args.wandb_logger)
                 #     Wandb.log(args.wandb_logger,
@@ -601,6 +607,7 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
     println("Building model...")
 
     nf_size, e_norms, n_norms, o_norms = calc_norms(ds_test, device, args)
+    nf_size = nf_size + 4   # Todo: Hard coded serialization
     ef_size = 0
     # Check if edge_features are used. If yes, use these dimensions, if not -> dims of mesh_pos
     if haskey(ds_test.meta, "edge_features")
@@ -622,13 +629,11 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
     for tf in ds_test.meta["target_features"]
         outputs += ds_test.meta["features"][tf]["dim"]
     end
-    println("Pre eval load")
     mgn, _, _, _ = load_(
         nf_size, ef_size, e_norms,
         n_norms, o_norms, outputs, args.mps, args.layer_size, args.hidden_layers,
         nothing, device, args.use_valid ? joinpath(cp_path, "valid") : cp_path, ml_module)
 
-    println("MGN.model ist: ", typeof(mgn.model))
     if typeof(mgn.model) <: Lux.Chain
         Lux.testmode(mgn.st)
     elseif typeof(mgn.model) <: Flux.Chain
@@ -638,8 +643,10 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
     clear_log(1, false)
     @info "Model built!"
 
-    eval_network!(
+    cum_mse_return = eval_network!(
         solver, mgn, ds_test, out_path, start, stop, dt, saves, mse_steps)
+
+    return cum_mse_return
 end
 
 """
@@ -666,6 +673,8 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
     local edges = Dict{Tuple{Int, String}, Array{Int32, 2}}()
 
     test_loader = DataLoader(ds_test; batchsize = -1, buffer = false, parallel = false)
+
+    cum_mse_return = 0.0f0
 
     for (ti, data) in enumerate(test_loader)
         fields = deleteat!(copy(ds_test.meta["feature_names"]),
@@ -699,12 +708,16 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
         for horizon in mse_steps
             err = mean(error[:, 1, findfirst(x -> x == horizon, saves)])
             cum_err = mean(error[:, 1, 1:findfirst(x -> x == horizon, saves)])
+            if cum_err > cum_mse_return
+                cum_mse_return = cum_err
+            end
             println("  Trajectory $ti | mse t=$(horizon): $err | cum_mse t=$(horizon): $cum_err | cum_rmse t=$(horizon): $(sqrt(cum_err))")
         end
 
         traj_ops[(ti, "mesh_pos")] = cpu_device()(data["mesh_pos"])
-        traj_ops[(ti, "gt")] = cpu_device()(vcat([data[field][:, :, 1:size(prediction, 3)]
-                                                  for field in ds_test.meta["target_features"]]...))
+        traj_ops[(ti, "gt")] = cpu_device()(vcat([data[field][
+                                                      :, :, 5:(size(prediction, 3) + 4)]
+                                                  for field in ds_test.meta["target_features"]]...))    # Todo: Adjusted from 1:... to 5: ...
         traj_ops[(ti, "prediction")] = cpu_device()(prediction)
         errors[(ti, "error")] = cpu_device()(error[:, 1, :])
         edges[(ti, "edges")] = cpu_device()(permutedims(hcat(
@@ -730,6 +743,8 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
     end
 
     @info "Evaluation completed!"
+
+    return cum_mse_return
 end
 
 end

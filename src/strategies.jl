@@ -117,6 +117,7 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     end
 
     gt = vcat([data[tf] for tf in meta["target_features"]]...)[:, :, data_interval]
+    # println("size nf in validation step: ", size(data))
 
     sol_u, _ = rollout(
         solver, mgn, data, fields, meta, meta["target_features"], target_dict,
@@ -146,15 +147,13 @@ function init_train_step(::SolverStrategy, t::Tuple, ta::Tuple)
     for tf in meta["target_features"]
         target_dict[tf] = meta["features"][tf]["dim"]
     end
-
     inputs = Dict{String, AbstractArray}(
-        [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1]) :
+        [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1:5]) :
          (field, data[field]) for field in fields]
     )
 
     gt = vcat([data[tf] for tf in meta["target_features"]]...)
-    u0 = gt[:, :, 1]
-
+    u0 = gt[:, :, 5]    # Todo: Hardcoded adjustment for initial 5 steps instead of one
     return (mgn, data, inputs, fields, meta, target_fields, target_dict,
         node_type, edge_features, senders, receivers, idx_mask, val_mask, u0, gt)
 end
@@ -166,7 +165,6 @@ function train_step(strategy::SolverStrategy, t::Tuple)
     if typeof(mgn.model) <: Flux.Chain
         mgn.ps, re = Flux.destructure(mgn.model)
     end
-
     ff = ODEFunction{false}((x, p, t) -> ode_func_train(x,
         (mgn, p, re, data, inputs, fields, meta,
             target_fields, target_dict, node_type,
@@ -174,6 +172,17 @@ function train_step(strategy::SolverStrategy, t::Tuple)
         t))
 
     prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), mgn.ps)
+
+    # u0_cpu = Array(u0)
+    # ps_cpu = Array(mgn.ps)
+    # prob_cpu = remake(prob; u0 = u0_cpu, p = ps_cpu)
+    # shoot_loss, shoot_gs = Zygote.withgradient(
+    #     ps -> train_loss(strategy,
+    #         (prob_cpu, ps, u0_cpu, nothing, gt, idx_mask,
+    #             val_mask, mgn.n_norm, target_fields,
+    #             [meta["features"][tf]["dim"] for tf in target_fields])),
+    #     ps_cpu)
+
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps -> train_loss(strategy,
             (prob, ps, u0, nothing, gt, idx_mask, val_mask, mgn.n_norm, target_fields,
@@ -200,7 +209,7 @@ end
 
 function validation_step(strategy::SolverStrategy, t::Tuple)
     sim_interval = (strategy.tstart):(strategy.dt):(strategy.tstop)
-    data_interval = 1:length(sim_interval)
+    data_interval = 5:length(sim_interval)  # Todo: hardcoded adjustment for initial 5 steps instead of one
 
     return _validation_step(t, sim_interval, data_interval)
 end
@@ -242,6 +251,11 @@ end
 
 function train_loss(strategy::SolverTraining, t::Tuple)
     prob, ps, u0, callback_solve, gt, idx_mask, val_mask, n_norm, target_fields, target_dims = t
+
+    # println("prob: ", typeof(prob))
+    # println("ps: ", size(ps))   # ps = previous state?
+    # println("u0: ", size(u0))
+    # println("gt: ", size(gt))
 
     sol = solve(remake(prob; p = ps), strategy.solver; u0 = u0,
         saveat = (strategy.tstart):(strategy.dt):(strategy.tstop),
@@ -404,8 +418,18 @@ function init_train_step(::DerivativeStrategy, t::Tuple, ::Tuple)
                                      (data["dt"][datapoint + 1] - data["dt"][datapoint])
                                      for field in target_fields]...)
 
+    # print("type data", typeof(data))
+    inputs = deepcopy(data)
+    # Reduce dimension from 3 to 2 for all inputs
+    for k in target_fields
+        if (ndims(inputs[k]) == 3)
+            # println("size input pre premutation: ", size(inputs[k]))
+            inputs[k] = vcat(eachslice(inputs[k]; dims = 3)...)
+            # println("size input post premutation: ", size(inputs[k]))
+        end
+    end
     graph = build_graph(
-        mgn, data, fields, datapoint, node_type, edge_features, senders, receivers)
+        mgn, inputs, fields, datapoint, node_type, edge_features, senders, receivers)
 
     return (mgn, graph, target_quantities_change, mask)
 end
