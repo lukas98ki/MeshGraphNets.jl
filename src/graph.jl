@@ -26,20 +26,7 @@ function create_base_graph!(data, type_size, type_min, device::Function)
     node_type = one_hot(
         vec(data["node_type"][:, :, 1]), type_size - type_min + 1, 1 - type_min)
 
-    edge_feature_keys = filter(k -> startswith(k, "edge|"), keys(data)) # get edge_feature_keys (those starting with edge|)
-
-    if length(edge_feature_keys) > 0
-        if length(edge_feature_keys) > 1
-            error("More than one edge key found: $(edge_feature_keys). Not yet implemented for more than one.")
-        elseif length(edge_feature_keys) == 1
-            senders, receivers = parse_custom_edges_features(data)
-            edge_feature_key = first(edge_feature_keys)
-            edge_features = data[edge_feature_key]  # Todo: sollte doppelt gemoppelt sein. Überprüfen
-        else
-            println("Something went wrong with number of edges?")
-        end
-
-    elseif haskey(data, "cells")
+    if haskey(data, "cells")
         senders, receivers = triangles_to_edges(data["cells"][:, :, 1])
         if 0 in senders || 0 in receivers
             senders .+= 1
@@ -47,6 +34,10 @@ function create_base_graph!(data, type_size, type_min, device::Function)
         end
         rel_vec = [data["mesh_pos"][:, senders[i], 1] -
                    data["mesh_pos"][:, receivers[i], 1] for i in eachindex(senders)]
+        relative_mesh_pos = hcat(rel_vec...)
+
+        mesh_features = vcat(
+            relative_mesh_pos, permutedims(map(norm, eachcol(relative_mesh_pos))))
     elseif haskey(data, "edges")
         senders, receivers = parse_edges(data["edges"])
         if 0 in senders || 0 in receivers
@@ -56,11 +47,8 @@ function create_base_graph!(data, type_size, type_min, device::Function)
         rel_vec = [data["mesh_pos"][:, senders[i], 1] -
                    data["mesh_pos"][:, receivers[i], 1] for i in eachindex(senders)]
         relative_mesh_pos = hcat(rel_vec...)
-        edge_features = vcat(
+        mesh_features = vcat(
             relative_mesh_pos, permutedims(map(norm, eachcol(relative_mesh_pos))))
-        println("size ef: ", size(edge_features))
-        println("tpye ", typeof(edge_features))
-
     else
         throw(KeyError("Data does not contain cell or edge information!"))
     end
@@ -68,7 +56,7 @@ function create_base_graph!(data, type_size, type_min, device::Function)
     data["node_type"] = device(node_type)
     data["senders"] = device(senders)
     data["receivers"] = device(receivers)
-    data["edge_features"] = device(edge_features)
+    data["mesh_features"] = device(mesh_features)
     # return device(node_type), device(senders), device(receivers), device(edge_features)
 end
 
@@ -91,9 +79,9 @@ Constructs a [FeatureGraph](@ref) based on the given arguments.
 ## Returns
 - Resulting [FeatureGraph](@ref).
 """
-function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer, node_type,
-        edge_features, senders::AbstractArray{T, 1},
-        receivers::AbstractArray{T, 1}) where {T <: Integer}
+function build_graph_old(
+        mgn::GraphNetwork, data, fields, datapoint::Integer, node_type, ef,
+        senders::AbstractArray{T, 1}, receivers::AbstractArray{T, 1}) where {T <: Integer}
     # Removed generator in favor of removing Zygote.jl piracies (minimal increase of time and allocations)
     # Can be reverted once Enzyme.jl is compatible
     #nt = mgn.n_norm["node_type"](node_type)
@@ -109,10 +97,11 @@ function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer, node_t
 
     # if idx > 1
     #     idx_iter = idx-4:idx
+    sleep(4)
     for field in fields
         # nf = vcat(nf, (data[field][1:datapoint, :]))  # Should work for solvertraining, since given data has dict{String, 5x26} format
-        nf = vcat(nf, (data[field][(datapoint - 4):datapoint, :]))  # Should work for Derivative
-        # nf = vcat(nf, (data[field][:, :, min(size(data[field], 3), datapoint)]))  # Original Line of code, but dont think it works
+        # nf = vcat(nf, (data[field][(datapoint - 4):datapoint, :]))  # Should work for Derivative
+        nf = vcat(nf, (data[field][:, :, min(size(data[field], 3), datapoint)]))  # Original Line of code
     end
     # println("size nf: ", size(nf))
     # println("type data: ", typeof(data))
@@ -133,8 +122,63 @@ function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer, node_t
         #     [mgn.n_norm[field](data[field][:, :, min(size(data[field], 3), datapoint)]) for field in fields]...,
         #     mgn.n_norm["node_type"](node_type)
         # ),
-        edge_features,
+        ef,
         senders,
         receivers
     )
 end
+
+function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer,
+        node_type, edge_features, senders::AbstractArray{T, 1},
+        receivers::AbstractArray{T, 1}) where {T <: Integer}
+    nt = mgn.n_norm["node_type"](node_type)
+    # nf = CUDA.zeros(Tnf, 0, size(nt, 2))
+    nf = similar(nt, 0, size(nt, 2))
+
+    for field in fields
+        @assert datapoint≤size(data[field], 3) "Datapoint $datapoint out of bounds for field $field"
+        nf = vcat(
+            nf, mgn.n_norm[field](data[field][:, :, min(size(data[field], 3), datapoint)]))
+    end
+    nf = vcat(nf, nt)
+
+    ef = mgn.e_norm["mesh_pos"](edge_features)  # Todo: Sollte doch zwischen -1 und 1 sein? ist aber auch bei 1.7? legal?
+
+    # edge_features = convert(typeof(nf), edge_features)
+
+    # Todo: Edge_Features anpassen, Normierung ähnlich wie bei node_features
+
+    return FeatureGraph(
+        nf,
+        ef,
+        senders,
+        receivers
+    )
+end
+
+# function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer, node_type, ef,
+#         senders::AbstractVector{T}, receivers::AbstractVector{T}) where {T <: Integer}
+#     println("Fields in build_graph: ", fields)
+#     println("Keys of data: ", keys(data))
+#     sleep(2)
+
+#     # Starte mit leerem Node-Feature-Array
+#     nf = similar(node_type, 0, size(node_type, 2))
+
+#     # Füge alle spezifizierten Features hinzu
+#     for field in fields
+#         nf = vcat(nf, data[field][:, :, min(datapoint, size(data[field], 3))])
+#     end
+
+#     # Hänge node_type als Features hinten dran
+#     nf = vcat(nf, node_type)
+
+#     println("Size of nf: ", size(nf))
+
+#     return FeatureGraph(
+#         nf,
+#         ef,
+#         senders,
+#         receivers
+#     )
+# end

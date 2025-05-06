@@ -120,7 +120,6 @@ function keystraj(datafile::String)
     return keys_traj
 end
 
-
 MLUtils.numobs(ds::Dataset) = ds.meta["n_trajectories"]
 
 function MLUtils.getobs!(buffer, ds::Dataset, idx)
@@ -129,14 +128,20 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
 
     for fn in ds.meta["feature_names"]
         alloc_traj!(buffer, ds, fn)
-
-        match_data = match_keys(ds, key, fn)
-
+        match_data = match_keys(ds, key, fn)    # only checks feature_names alias node_features
         set_traj_data!(buffer, match_data, ds, fn)
     end
-    set_edges!(buffer, ds, key)
 
-    set_edge_features!(buffer, ds, key)
+    set_edges!(buffer, ds, key)
+    if haskey(ds.meta, "edge_features")
+        for ef in ds.meta["edge_features"]
+            alloc_traj!(buffer, ds, ef)
+            match_data = match_keys(ds, key, ef)    # only checks feature_names alias edge_features
+            set_traj_data!(buffer, match_data, ds, ef)
+        end
+    end
+
+    # set_edge_features!(buffer, ds, key)
 
     prepare_trajectory!(buffer, ds.meta, ds.meta["device"])
 
@@ -157,6 +162,8 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
 
     create_base_graph!(buffer, ds.meta["features"]["node_type"]["data_max"],
         ds.meta["features"]["node_type"]["data_min"], ds.meta["device"])
+
+    # println("Buffer keys: ", keys(buffer))
 
     return buffer
 end
@@ -325,6 +332,20 @@ function set_meta!(traj_dict::Dict{String, Any}, ds::Dataset, key::String)
     traj_dict["dims"] = dims
 end
 
+"""
+    alloc_traj!(traj_dict, ds, fn)
+
+Initialisiert Speicher für ein gegebenes Node-Feature in der Trajektorie.
+
+## Arguments
+- `traj_dict`: Dictionary zur Aufnahme der Trajektoriendaten.
+- `ds`: Dataset mit Metadaten zu den Features.
+- `fn`: Name des Features, das allokiert werden soll.
+
+Falls das Feature dynamisch ist, wird für jeden Zeitschritt Speicher angelegt.
+Bei statischen Features wird nur für einen Zeitschritt (tl = 1) Speicher reserviert.
+Falls vorhanden, wird auch Speicher für die zugehörige Fehlerabschätzung (".ev") angelegt.
+"""
 function alloc_traj!(traj_dict::Dict{String, Any}, ds::Dataset, fn::String)
     dim = haskey(ds.meta["features"][fn], "dim") ? ds.meta["features"][fn]["dim"] : 1
     if ds.meta["features"][fn]["type"] == "static"
@@ -343,6 +364,43 @@ function alloc_traj!(traj_dict::Dict{String, Any}, ds::Dataset, fn::String)
         if !haskey(traj_dict, fn * ".ev")
             traj_dict[fn * ".ev"] = zeros(
                 eltype(traj_dict[fn]), 2, traj_dict["n_nodes"], tl)
+        end
+    end
+end
+
+"""
+    alloc_traj_for_edges!(traj_dict, ds, fn)
+
+Initialisiert Speicher für ein gegebenes Edge-Feature in der Trajektorie.
+
+## Arguments
+- `traj_dict`: Dictionary zur Aufnahme der Trajektoriendaten.
+- `ds`: Dataset mit Metadaten zu den Features.
+- `fn`: Name des Edge-Features, das allokiert werden soll.
+
+Die Dimension des Speicherarrays richtet sich nach der Anzahl der Kanten und dem Zeithorizont.
+Zusätzlich wird – sofern vorhanden – auch Speicher für die Fehlerabschätzung (".ev") angelegt.
+"""
+
+function alloc_traj_for_edges!(traj_dict::Dict{String, Any}, ds::Dataset, fn::String)
+    dim = haskey(ds.meta["features"][fn], "dim") ? ds.meta["features"][fn]["dim"] : 1
+    n_edges = size(traj_dict["edges"], 2)
+    if ds.meta["features"][fn]["type"] == "static"
+        tl = 1
+    elseif ds.meta["features"][fn]["type"] == "dynamic"
+        tl = traj_dict["trajectory_length"]
+    else
+        throw(ArgumentError("feature type of feature \"$fn\" must be static or dynamic"))
+    end
+    if !haskey(traj_dict, fn)
+        traj_dict[fn] = zeros(
+            getfield(Base, Symbol(uppercasefirst(ds.meta["features"][fn]["dtype"]))),
+            dim, n_edges, tl)
+    end
+    if haskey(ds.meta["features"][fn], "has_ev") && ds.meta["features"][fn]["has_ev"]
+        if !haskey(traj_dict, fn * ".ev")
+            traj_dict[fn * ".ev"] = zeros(
+                eltype(traj_dict[fn]), 2, n_edges, tl)
         end
     end
 end
@@ -396,6 +454,50 @@ function match_keys(ds::Dataset, key::String, fn::String)
     return match_data
 end
 
+function match_edge_keys(ds::Dataset, key::String, fn::String)
+    # Regex für edge[%d].feature
+    rx = Regex(replace(
+        replace(replace(ds.meta["features"][fn]["key"], "[" => "\\["),
+            "]" => "\\]"),
+        "%d" => "\\d+"))
+
+    match_data = Dict()
+
+    lock(ds.lock) do
+        if endswith(ds.datafile, ".jld2")
+            file = jldopen(ds.datafile, "r")
+            traj = file[key]
+            rx_match = eachmatch.(rx, keys(traj))
+            deleteat!(rx_match, findall(x -> length(collect(x)) == 0, rx_match))
+            matches = unique(getfield.(getindex.(collect.(rx_match), 1), :match))
+            for m in matches
+                match_data[m] = traj[m]
+                if haskey(ds.meta["features"][fn], "has_ev") &&
+                   ds.meta["features"][fn]["has_ev"]
+                    match_data[m * ".ev"] = traj[m * ".ev"]
+                end
+            end
+        else
+            file = h5open(ds.datafile, "r")
+            traj = open_group(file, key)
+            rx_match = eachmatch.(rx, keys(traj))
+            deleteat!(rx_match, findall(x -> length(collect(x)) == 0, rx_match))
+            matches = unique(getfield.(getindex.(collect.(rx_match), 1), :match))
+            for m in matches
+                match_data[m] = Base.read(traj, m)
+                if haskey(ds.meta["features"][fn], "has_ev") &&
+                   ds.meta["features"][fn]["has_ev"]
+                    match_data[m * ".ev"] = Base.read(traj, m * ".ev")
+                end
+            end
+        end
+        close(file)
+    end
+
+    return match_data
+end
+
+# Todo Edges: Sollte bereits funktionieren, sowohl für statische edges als auch dynamische
 function set_traj_data!(traj_dict::Dict{String, Any}, match_data, ds::Dataset, fn::String)
     for (m, data) in match_data
         if !occursin("]", m[1:(end - 1)])
@@ -430,16 +532,21 @@ function set_traj_data!(traj_dict::Dict{String, Any}, match_data, ds::Dataset, f
             end
 
             fn_k = occursin(".ev", m) ? "$fn.ev" : fn
-
+            # Anpassung ob edge_feature oder node_feature
             if typeof(idx) <: AbstractArray
                 if length(idx) > 1
-                    idx_node = dims_to_li(traj_dict["dims"], idx)
+                    if fn in ds.meta["edge_features"]
+                        idx_node = idx  # Edge-Feature → direkter Index
+                    else
+                        idx_node = dims_to_li(traj_dict["dims"], idx)  # Node-Feature → dims_to_li
+                    end
                 else
                     idx_node = idx
                 end
             else
                 idx_node = idx
             end
+
             if ds.meta["features"][fn]["type"] == "dynamic"
                 if ndims(data) == 2
                     traj_dict[fn_k][coord, idx_node, :] = data[
@@ -516,8 +623,6 @@ function set_edges!(traj_dict::Dict{String, Any}, ds::Dataset, key::String)
         close(file)
     end
 end
-
-
 
 """
     create_edges(dims, node_type, excluded_node_types)
@@ -640,7 +745,7 @@ Parses the edges that were read from the datafile. The format is a vector of pai
 function parse_custom_edges(edges, node_type, no_edges_node_types, exclude_node_indices)
     if edges isa Matrix{Int64}
         edges = collect(eachrow(edges))  # Umwandeln in Vector von Arrays
-    end    
+    end
     exclude_indices = findall(x -> x ∈ no_edges_node_types, node_type)
     exclude_indices = vcat(exclude_indices, exclude_node_indices)
     filtered_edges = filter(x -> x[1] ∉ exclude_indices && x[2] ∉ exclude_indices, edges)
@@ -746,6 +851,7 @@ Transfers the data to the given device and configures the data if a derivative b
 - Metadata of the dataset.
 """
 function prepare_trajectory!(data, meta, device::Function)
+    # If derivative, else solver
     if !isnothing(meta["training_strategy"]) &&
        (typeof(meta["training_strategy"]) <: DerivativeStrategy)
         add_targets!(data, meta["target_features"], device)
@@ -769,8 +875,6 @@ function prepare_trajectory!(data, meta, device::Function)
     return data, meta
 end
 
-
-
 """
     set_edge_features!(buffer, ds, key)
 
@@ -792,11 +896,22 @@ function set_edge_features!(buffer, ds::Dataset, key::String)
                 if endswith(ds.datafile, ".jld2")
                     jldopen(ds.datafile, "r") do file
                         traj = file[key]
-                        if haskey(traj, edge_feature)
-                            buffer["edge|" * edge_feature] = traj[edge_feature]
+                        n_edges = maximum(size(traj["edges"]))
+                        println("Number of edges: ", n_edges)
+                        if haskey(traj, "edge[1].$edge_feature")
+                            data = [traj["edge[$i].$edge_feature"] for i in 1:n_edges]
+                            # buffer["edge[$i]." * edge_feature] = traj["edge[$i]." * edge_feature]
+                            buffer["edge|" * edge_feature] = permutedims(
+                                hcat(data...), (2, 1))  # (n_edges, Zeitpunkte)
+                            println(
+                                "Size edge_feature: ", size(buffer["edge|" * edge_feature]))
+                        elseif haskey(traj, edge_feature)
+                            buffer["edge|" * edge_feature] = traj[edge_feature] # (n_edges, 1) ?
+                            println("Size static edge_feautre: ", traj[edge_feature])
                         else
                             println("Edge Feature $edge_feature fehlt, Standardwerte werden genutzt.")
-                            buffer["edge|" * edge_feature] = ones(Float32, size(buffer["edges"], 2), 1)
+                            buffer["edge|" * edge_feature] = ones(
+                                Float32, size(buffer["edges"], 2), 1)
                         end
                     end
                 else
@@ -806,7 +921,8 @@ function set_edge_features!(buffer, ds::Dataset, key::String)
                             buffer[edge_feature] = Base.read(traj, edge_feature)
                         else
                             println("Edge Feature $edge_feature fehlt, Standardwerte werden genutzt.")
-                            buffer[edge_feature] = ones(Float32, size(buffer["edges"], 2), 1)
+                            buffer[edge_feature] = ones(
+                                Float32, size(buffer["edges"], 2), 1)
                         end
                     end
                 end
@@ -814,4 +930,3 @@ function set_edge_features!(buffer, ds::Dataset, key::String)
         end
     end
 end
-

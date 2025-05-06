@@ -83,7 +83,8 @@ function data_minmax(path)
             end
         end
         for ef in edge_features
-            if !haskey(ds_train.meta["features"][ef], "onehot") && isnumber(ds_train.meta, ef)
+            if !haskey(ds_train.meta["features"][ef], "onehot") &&
+               isnumber(ds_train.meta, ef)
                 data_min = minimum(data["edge|$ef"])
                 data_max = maximum(data["edge|$ef"])
                 if data_min < result[ef][1]
@@ -96,7 +97,8 @@ function data_minmax(path)
         end
 
         for tf in target_features
-            if !haskey(ds_train.meta["features"][tf], "onehot") && isnumber(ds_train.meta, tf)
+            if !haskey(ds_train.meta["features"][tf], "onehot") &&
+               isnumber(ds_train.meta, tf)
                 ddiff = data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]
                 dts = Float32.(data["dt"][2:end] - data["dt"][1:(end - 1)])
                 for i in eachindex(dts)
@@ -318,4 +320,85 @@ function clear_log(lines::Integer, move_up = true)
     for _ in 1:lines
         clear_line()
     end
+end
+
+function print_gradients(g; prefix = "")
+    if g === nothing
+        println("$prefix → nothing")
+    elseif isa(g, AbstractArray)
+        println("$prefix → mean=$(mean(abs, g)), min=$(minimum(abs.(g))), max=$(maximum(abs.(g)))")
+    elseif isa(g, NamedTuple)
+        for (k, v) in pairs(g)
+            print_gradients(v; prefix = "$prefix.$k")
+        end
+    elseif isa(g, Tuple)
+        for (i, v) in enumerate(g)
+            print_gradients(v; prefix = "$prefix[$i]")
+        end
+    else
+        println("$prefix → unsupported type: ", typeof(g))
+    end
+end
+
+function debug_training_snapshot(data, losses, gs, mgn, fields, datapoint)
+    println("\n--- DEBUG SNAPSHOT ---")
+
+    println("Loss sum: ", sum(losses))
+    println("Loss shape: ", size(losses))
+
+    # Mask check
+    println("Mask sum: ", sum(data["mask"]))
+    println("Val mask sum: ", sum(data["val_mask"]))
+    println("Target shapes:")
+    println("Fields of data: ", keys(data))
+    println("Fields of fields: ", fields)
+    target_fields = filter(f -> occursin("target|", f), keys(data))
+    for tkey in target_fields
+        f = replace(tkey, "target|" => "")
+        println("  ", tkey, " → ", size(data[f]), " | ", tkey, " → ", size(data[tkey]))
+    end
+
+    # Normierte Feature-Werte
+    for f in fields
+        val = data[f][:, :, datapoint]
+        m = mean(val)
+        println("Feature $f @ step $datapoint: min=$(minimum(val)), max=$(maximum(val)), mean=$(m), std=$(stdm(val, m))")
+    end
+
+    sleep(2)
+    println("Gradient Check:")
+    # Gradient check (falls vorhanden)
+    try
+        println("Size of gradients: ", length(gs))
+        sleep(4)
+        for (i, g) in enumerate(gs)
+            println("Grad[$i] → ", typeof(g))
+            print_gradients(g; prefix = "Grad[$i]")
+            sleep(1)
+        end
+    catch e
+        println("Gradient check failed")
+    end
+
+    sleep(2)
+    println("Prediction vs Target Check:")
+    # Prediction vs Target check
+    println("Gradient Check:")
+    try
+        for (i, g) in enumerate(gs.grads)
+            name = keys(gs.grads)[i]
+            val = g[2]
+            if val === nothing
+                println("Grad[$i] ($name) → nothing")
+            elseif isa(val, AbstractArray)
+                println("Grad[$i] ($name) → mean(abs) = $(mean(abs, val)), min = $(minimum(abs.(val))), max = $(maximum(abs.(val)))")
+            else
+                println("Grad[$i] ($name) → scalar = $val")
+            end
+        end
+    catch e
+        println("Gradient check failed: ", e)
+    end
+
+    println("--- END DEBUG ---\n")
 end

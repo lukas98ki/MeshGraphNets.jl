@@ -85,16 +85,16 @@ function calc_norms(dataset, device, args::Args)
         for ef in dataset.meta["edge_features"]
             if haskey(dataset.meta["features"][ef], "data_mean") &&
                haskey(dataset.meta["features"][ef], "data_std")
-                e_norms = NormaliserOfflineMeanStd(
+                e_norms[ef] = NormaliserOfflineMeanStd(
                     Float32(dataset.meta["features"][ef]["data_mean"]),
                     Float32(dataset.meta["features"][ef]["data_std"]))
-            elseif haskey(dataset.meta["edges"], "data_min") &&
-                   haskey(dataset.meta["edges"], "data_max")
-                e_norms = NormaliserOfflineMinMax(
+            elseif haskey(dataset.meta["features"], "data_min") &&
+                   haskey(dataset.meta["features"], "data_max")
+                e_norms[ef] = NormaliserOfflineMinMax(
                     Float32(dataset.meta["features"][ef]["data_min"]),
                     Float32(dataset.meta["features"][ef]["data_max"]))
             else
-                e_norms = NormaliserOnline(
+                e_norms[ef] = NormaliserOnline(
                     dataset.meta["features"][ef]["dim"],
                     device; max_acc = Float32(args.max_norm_steps))
             end
@@ -103,20 +103,22 @@ function calc_norms(dataset, device, args::Args)
         println("Sind doch bei edges drin :( ")
         if haskey(dataset.meta["edges"], "data_min") &&
            haskey(dataset.meta["edges"], "data_max")
-            e_norms = NormaliserOfflineMinMax(Float32(dataset.meta["edges"]["data_min"]),
+            e_norms["mesh_pos"] = NormaliserOfflineMinMax(
+                Float32(dataset.meta["edges"]["data_min"]),
                 Float32(dataset.meta["edges"]["data_max"]))
         elseif haskey(dataset.meta["edges"], "data_mean") &&
                haskey(dataset.meta["edges"], "data_std")
-            e_norms = NormaliserOfflineMeanStd(Float32(dataset.meta["edges"]["data_mean"]),
+            e_norms["mesh_pos"] = NormaliserOfflineMeanStd(
+                Float32(dataset.meta["edges"]["data_mean"]),
                 Float32(dataset.meta["edges"]["data_std"]))
         else
-            e_norms = NormaliserOnline(
+            e_norms["mesh_pos"] = NormaliserOnline(
                 typeof(dataset.meta["dims"]) <: AbstractArray ?
                 length(dataset.meta["dims"]) + 1 : dataset.meta["dims"] + 1,
                 device)
         end
     else
-        e_norms = NormaliserOnline(
+        e_norms["mesh_pos"] = NormaliserOnline(
             typeof(dataset.meta["dims"]) <: AbstractArray ?
             length(dataset.meta["dims"]) + 1 : dataset.meta["dims"] + 1,
             device)
@@ -323,13 +325,16 @@ function train_network(opt, ds_path, cp_path; kws...)
 
     println("Building model...")
 
+    dims = ds_train.meta["dims"]
     nf_size, e_norms, n_norms, o_norms = calc_norms(ds_train, device, args)
     ef_size = 0
     # Check if edge_features are used. If yes, use these dimensions, if not -> dims of mesh_pos
+    # Todo: könnte zu calc_norms verschoben werden; da wird ja auch nf_size berechnet
     if haskey(ds_train.meta, "edge_features")
         if length(ds_train.meta["edge_features"]) != 0
             for ef in ds_train.meta["edge_features"]
                 ef_size += ds_train.meta["features"][ef]["dim"]
+                ef_size += 2
             end
         else
             println("Edge_feature bracket is empty! Using mesh_pos!")
@@ -341,11 +346,12 @@ function train_network(opt, ds_path, cp_path; kws...)
         ef_size = dims + 1
     end
 
-    nf_size = nf_size + 4   # Todo: Garbage coding! done because we serialize 4 extra timesteps es input_features
+    # nf_size = nf_size + 4   # Todo: Garbage coding! done because we serialize 4 extra timesteps es input_features # removed since we dont serialize with House_mesh
     outputs = 0
     for tf in ds_train.meta["target_features"]
         outputs += ds_train.meta["features"][tf]["dim"]
     end
+
     mgn, opt_state, df_train, df_valid = GraphNetCore.load_(
         nf_size, ef_size,
         e_norms, n_norms, o_norms, outputs, args.mps,
@@ -409,6 +415,7 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
 
     local tmp_loss = 0.0f0
     local avg_loss = 0.0f0
+    # Todo: Wouldnt it be cleaner to delete all static fields?
     fields = deleteat!(copy(ds_train.meta["feature_names"]),
         findall(x -> x == "node_type" || x == "mesh_pos" || x == "cells",
             ds_train.meta["feature_names"]))
@@ -425,28 +432,25 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                 break
             end
             delta = get_delta(args.training_strategy, data["trajectory_length"])    # derivative = length; solver = 1
+            # println("delta: ", delta)
             if args.training_strategy isa SolverStrategy    # Todo: Add variable that checks if multiple previous timesteps should be considered, than do this
-                delta = 5   # Todo: hardcoded, instead variable
+                delta = 1   # Todo: hardcoded, instead variable
             end
-            for datapoint in 5:delta    # Number of watch back states Todo: Make it a function variable; Delta is 1 in solver case  # old default: 1:delta
+            for datapoint in 1:delta    # Number of watch back states Todo: Make it a function variable; Delta is 1 in solver case  # old default: 1:delta
                 train_tuple = init_train_step(args.training_strategy,
                     (mgn, data, ds_train.meta, fields,
                         ds_train.meta["target_features"], data["node_type"],
-                        data["edge_features"], data["senders"], data["receivers"],
+                        data["mesh_features"], data["senders"], data["receivers"],
                         datapoint, data["mask"], data["val_mask"]),
                     train_tuple_additional)
 
                 gs, losses = train_step(args.training_strategy, train_tuple)
+                # println("losses: ", losses)
                 tmp_loss += sum(losses)
 
                 if step + datapoint > args.norm_steps
+                    # debug_training_snapshot(data, losses, gs, mgn, fields, datapoint)
                     for i in eachindex(gs)
-                        # g = gs[i]
-                        # avg_g = mean(abs, g)
-                        # min_g = minimum(abs.(g))
-                        # max_g = maximum(abs.(g))
-                        # println("Gradients (i=$i): avg = $avg_g | min = $min_g | max = $max_g")
-
                         if args.backend == :Lux || args.training_strategy isa SolverStrategy
                             opt_state, ps = Optimisers.update(opt_state, mgn.ps, gs[i])
                             mgn.ps = ps
@@ -454,8 +458,15 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                                 mgn.model = Flux.destructure(mgn.model)[2](mgn.ps)
                             end
                         else
+                            # println("weight before", mgn.model.layers[1].node_layer.layers[1].weight[1:5])
                             opt_state, nm = Optimisers.update!(opt_state, mgn.model, gs[i])
                             mgn.model = nm
+                            if (step + datapoint) % 500 == 0
+                                println("weight after update: ",
+                                    mgn.model.layers[1].node_layer.layers[1].weight[1:5])
+                            end
+                            # println("weight after",
+                            #     mgn.model.layers[1].node_layer.layers[1].weight[1:5])
                         end
                     end
                     update!(pr, step + datapoint;
@@ -470,6 +481,8 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                     # if !isnothing(args.wandb_logger)
                     #     Wandb.log(args.wandb_logger, Dict("train_loss" => sum(losses)))
                     # end
+
+                    # debug_training_snapshot(data, losses, gs, mgn, fields, datapoint)
                 else
                     update!(pr, step + datapoint;
                         showvalues = [
@@ -481,12 +494,17 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
             cp_progress += delta
             step += delta
             tmp_loss /= delta
+            println("tmp_loss: ", tmp_loss) # loss averaged overy trajectory
 
             avg_loss += tmp_loss
             tmp_loss = 0.0f0
 
             if step > args.norm_steps && cp_progress >= args.checkpoint
                 push!(df_train, [step, avg_loss / Float32(step / delta)])
+
+                println("weight before validation step",
+                    mgn.model.layers[1].node_layer.layers[1].weight[1:5])
+                sleep(5)
 
                 traj_idx = 1
                 valid_error = 0.0f0
@@ -503,21 +521,21 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                         (
                             mgn, data_valid, ds_valid.meta, delta, args.solver_valid,
                             args.solver_valid_dt, fields, data_valid["node_type"],
-                            data_valid["edge_features"], data_valid["senders"],
+                            data_valid["mesh_features"], data_valid["senders"],
                             data_valid["receivers"], data_valid["mask"],
                             data_valid["val_mask"], data_valid["inflow_mask"], pr_solver
                         ))
 
                     valid_error += ve
 
-                    clear_log(3)
+                    # clear_log(3)
                     next!(pr_valid;
                         showvalues = [
                             (:trajectory, "$traj_idx/$(ds_valid.meta["n_trajectories"])"),
                             (:valid_loss, "$(valid_error / traj_idx)")])
                     traj_idx += 1
                 end
-                clear_log(4)
+                # clear_log(4)
 
                 # if !isnothing(args.wandb_logger)
                 #     Wandb.log(args.wandb_logger,
@@ -606,14 +624,15 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
 
     println("Building model...")
 
+    dims = ds_test.meta["dims"]
     nf_size, e_norms, n_norms, o_norms = calc_norms(ds_test, device, args)
-    nf_size = nf_size + 4   # Todo: Hard coded serialization
     ef_size = 0
     # Check if edge_features are used. If yes, use these dimensions, if not -> dims of mesh_pos
     if haskey(ds_test.meta, "edge_features")
         if length(ds_test.meta["edge_features"]) != 0
             for ef in ds_test.meta["edge_features"]
                 ef_size += ds_test.meta["features"][ef]["dim"]
+                ef_size += 2    # Todo: Temp hardcoded, this 2 is for the mesh_pos and distance
             end
         else
             println("Edge_feature bracket is empty! Using mesh_pos!")
@@ -629,6 +648,7 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
     for tf in ds_test.meta["target_features"]
         outputs += ds_test.meta["features"][tf]["dim"]
     end
+
     mgn, _, _, _ = load_(
         nf_size, ef_size, e_norms,
         n_norms, o_norms, outputs, args.mps, args.layer_size, args.hidden_layers,
@@ -691,7 +711,7 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
 
         sol_u, sol_t = rollout(
             solver, mgn, data, fields, ds_test.meta, ds_test.meta["target_features"],
-            target_dict, data["node_type"], data["edge_features"], data["senders"],
+            target_dict, data["node_type"], data["mesh_features"], data["senders"],
             data["receivers"], data["val_mask"], data["inflow_mask"], start, stop, dt,
             saves, pr)
 
@@ -716,8 +736,8 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
 
         traj_ops[(ti, "mesh_pos")] = cpu_device()(data["mesh_pos"])
         traj_ops[(ti, "gt")] = cpu_device()(vcat([data[field][
-                                                      :, :, 5:(size(prediction, 3) + 4)]
-                                                  for field in ds_test.meta["target_features"]]...))    # Todo: Adjusted from 1:... to 5: ...
+                                                      :, :, 1:size(prediction, 3)]
+                                                  for field in ds_test.meta["target_features"]]...))
         traj_ops[(ti, "prediction")] = cpu_device()(prediction)
         errors[(ti, "error")] = cpu_device()(error[:, 1, :])
         edges[(ti, "edges")] = cpu_device()(permutedims(hcat(

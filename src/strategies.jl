@@ -117,15 +117,21 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     end
 
     gt = vcat([data[tf] for tf in meta["target_features"]]...)[:, :, data_interval]
-    # println("size nf in validation step: ", size(data))
 
     sol_u, _ = rollout(
         solver, mgn, data, fields, meta, meta["target_features"], target_dict,
         node_type, edge_features, senders, receivers, val_mask, inflow_mask,
         sim_interval[1], sim_interval[end], solver_dt, sim_interval, pr)
+
     prediction = cat(sol_u...; dims = 3)[:, :, data_interval]
 
+    println("size gt and prediction: ", size(gt), " ", size(prediction))
     error = mean((prediction - gt) .^ 2; dims = 3)
+
+    # println("size gt and prediction: ", size(gt), " ", size(prediction))
+    # println("gt:    min=$(minimum(gt)), max=$(maximum(gt)), mean=$(mean(gt))")
+    # println("pred:  min=$(minimum(prediction)), max=$(maximum(prediction)), mean=$(mean(prediction))")
+    # println("error: min=$(minimum(error)), max=$(maximum(error)), mean=$(mean(error))")
 
     return mean(error[mask])
 end
@@ -148,12 +154,12 @@ function init_train_step(::SolverStrategy, t::Tuple, ta::Tuple)
         target_dict[tf] = meta["features"][tf]["dim"]
     end
     inputs = Dict{String, AbstractArray}(
-        [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1:5]) :
+        [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1]) :
          (field, data[field]) for field in fields]
     )
 
     gt = vcat([data[tf] for tf in meta["target_features"]]...)
-    u0 = gt[:, :, 5]    # Todo: Hardcoded adjustment for initial 5 steps instead of one
+    u0 = gt[:, :, 1]    # Todo: Hardcoded adjustment for initial 5 steps instead of one
     return (mgn, data, inputs, fields, meta, target_fields, target_dict,
         node_type, edge_features, senders, receivers, idx_mask, val_mask, u0, gt)
 end
@@ -173,19 +179,9 @@ function train_step(strategy::SolverStrategy, t::Tuple)
 
     prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), mgn.ps)
 
-    # u0_cpu = Array(u0)
-    # ps_cpu = Array(mgn.ps)
-    # prob_cpu = remake(prob; u0 = u0_cpu, p = ps_cpu)
-    # shoot_loss, shoot_gs = Zygote.withgradient(
-    #     ps -> train_loss(strategy,
-    #         (prob_cpu, ps, u0_cpu, nothing, gt, idx_mask,
-    #             val_mask, mgn.n_norm, target_fields,
-    #             [meta["features"][tf]["dim"] for tf in target_fields])),
-    #     ps_cpu)
-
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps -> train_loss(strategy,
-            (prob, ps, u0, nothing, gt, idx_mask, val_mask, mgn.n_norm, target_fields,
+            (prob, ps, u0, nothing, gt, val_mask, mgn.n_norm, target_fields,
                 [meta["features"][tf]["dim"] for tf in target_fields])),
         mgn.ps)
     return shoot_gs, shoot_loss
@@ -209,8 +205,7 @@ end
 
 function validation_step(strategy::SolverStrategy, t::Tuple)
     sim_interval = (strategy.tstart):(strategy.dt):(strategy.tstop)
-    data_interval = 5:length(sim_interval)  # Todo: hardcoded adjustment for initial 5 steps instead of one
-
+    data_interval = 1:length(sim_interval)  # Todo: hardcoded adjustment for initial 5 steps instead of one
     return _validation_step(t, sim_interval, data_interval)
 end
 
@@ -249,13 +244,8 @@ function SolverTraining(tstart::Float32,
     SolverTraining(tstart, dt, tstop, solver, sense, solargs)
 end
 
-function train_loss(strategy::SolverTraining, t::Tuple)
+function train_loss_in_serialization(strategy::SolverTraining, t::Tuple)
     prob, ps, u0, callback_solve, gt, idx_mask, val_mask, n_norm, target_fields, target_dims = t
-
-    # println("prob: ", typeof(prob))
-    # println("ps: ", size(ps))   # ps = previous state?
-    # println("u0: ", size(u0))
-    # println("gt: ", size(gt))
 
     sol = solve(remake(prob; p = ps), strategy.solver; u0 = u0,
         saveat = (strategy.tstart):(strategy.dt):(strategy.tstop),
@@ -266,10 +256,22 @@ function train_loss(strategy::SolverTraining, t::Tuple)
 
     error = (gt[:, idx_mask, 1:size(pred, 3)] .- pred) .^ 2
     return mean(error)
+end
 
-    # local gt_n
-    # local pred_n
+function train_loss(strategy::SolverTraining, t::Tuple)
+    prob, ps, u0, callback_solve, gt, val_mask, n_norm, target_fields, target_dims = t
 
+    sol = solve(remake(prob; p = ps), strategy.solver; u0 = u0,
+        saveat = (strategy.tstart):(strategy.dt):(strategy.tstop),
+        tstops = (strategy.tstart):(strategy.dt):(strategy.tstop),
+        sensealg = strategy.sense, callback = callback_solve, strategy.solargs...)
+
+    pred = typeof(gt) <: CuArray ? CuArray(sol) : Array(sol)
+
+    local gt_n
+    local pred_n
+
+    # Wirft stack overflow fehler bei länge von 502 in trajektorie
     # for i in eachindex(target_fields)
     #     gt_n = vcat(
     #         [cat(
@@ -286,20 +288,38 @@ function train_loss(strategy::SolverTraining, t::Tuple)
     #          ) for i in eachindex(target_fields)]...
     #     )
     # end
+    gt_n = vcat(
+        [reduce((x, y) -> cat(x, y; dims = 3),
+             [n_norm[target_fields[i]](gt[
+                  (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+              for ts in axes(pred, 3)])
+         for i in eachindex(target_fields)]...
+    )
 
-    # error = (gt_n[:, :, 1:size(pred, 3)] .- pred_n) .^ 2 |> cpu_device()
+    pred_n = vcat(
+        [reduce((x, y) -> cat(x, y; dims = 3),
+             [n_norm[target_fields[i]](pred[
+                  (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+              for ts in axes(pred, 3)])
+         for i in eachindex(target_fields)]...
+    )
 
-    # err_buf = Zygote.Buffer(error)
+    # println("gt:    min=$(minimum(gt[:, 3, :])), max=$(maximum(gt[:, 3, :])), mean=$(mean(gt[:, 3, :]))")
+    # println("gt_n:  min=$(minimum(gt_n[:, 3, :])), max=$(maximum(gt_n[:, 3, :])), mean=$(mean(gt_n[:, 3, :]))")
 
-    # vm = cpu_device()(val_mask)
+    error = (gt_n[:, :, 1:size(pred, 3)] .- pred_n) .^ 2 |> cpu_device()
 
-    # err_buf[:, :, :] = error
-    # for i in axes(err_buf, 3)
-    #     err_buf[:, :, i] = err_buf[:, :, i] .* vm
-    # end
-    # loss = mean(copy(err_buf))
+    err_buf = Zygote.Buffer(error)
 
-    # return loss
+    vm = cpu_device()(val_mask)
+
+    err_buf[:, :, :] = error
+    for i in axes(err_buf, 3)
+        err_buf[:, :, i] = err_buf[:, :, i] .* vm
+    end
+    loss = mean(copy(err_buf))
+
+    return loss
 end
 
 """
@@ -406,30 +426,13 @@ end
 function init_train_step(::DerivativeStrategy, t::Tuple, ::Tuple)
     mgn, data, meta, fields, target_fields, node_type, edge_features, senders, receivers, datapoint, mask, _ = t
 
-    # target_quantities_change = vcat([mgn.o_norm[field]((data["target|" * field][
-    #                                      :, :, datapoint] -
-    #                                                     data[field][:, :, datapoint]) /
-    #                                                    (data["dt"][datapoint + 1] -
-    #                                                     data["dt"][datapoint]))
-    #                                  for field in target_fields]...)
-
     target_quantities_change = vcat([(data["target|" * field][:, :, datapoint] -
                                       data[field][:, :, datapoint]) /
                                      (data["dt"][datapoint + 1] - data["dt"][datapoint])
                                      for field in target_fields]...)
 
-    # print("type data", typeof(data))
-    inputs = deepcopy(data)
-    # Reduce dimension from 3 to 2 for all inputs
-    for k in target_fields
-        if (ndims(inputs[k]) == 3)
-            # println("size input pre premutation: ", size(inputs[k]))
-            inputs[k] = vcat(eachslice(inputs[k]; dims = 3)...)
-            # println("size input post premutation: ", size(inputs[k]))
-        end
-    end
     graph = build_graph(
-        mgn, inputs, fields, datapoint, node_type, edge_features, senders, receivers)
+        mgn, data, fields, datapoint, node_type, edge_features, senders, receivers)
 
     return (mgn, graph, target_quantities_change, mask)
 end
@@ -443,7 +446,6 @@ end
 function validation_step(::DerivativeStrategy, t::Tuple)
     sim_interval = t[2]["dt"][1]:(t[2]["dt"][2] - t[2]["dt"][1]):t[2]["dt"][t[4]]
     data_interval = 1:t[4]
-
     return _validation_step(t, sim_interval, data_interval)
 end
 

@@ -1,8 +1,4 @@
-#
-# Copyright (c) 2023 Julian Trommer
-# Licensed under the MIT license. See LICENSE file in the project root for details.
-#
-
+using Revise
 using MeshGraphNets
 
 import OrdinaryDiffEq: Euler, Tsit5
@@ -17,10 +13,10 @@ layer_size = 128
 hidden_layers = 2
 batch = 1
 epo = 1
-ns = 10e6
-norm_steps = 1000
+ns = 10000
+norm_steps = 500
 cuda = true
-cp_derivative = 10000
+cp_derivative = 1000
 cp_solver = 10
 
 ########################
@@ -71,23 +67,23 @@ solver_eval_adaptive_timesteps = Tsit5()
 
 # with DerivativeTraining
 
-# train_network(
-#     opt, ds_path, chk_path; mps = message_steps, layer_size = layer_size,
-#     hidden_layers = hidden_layers, batchsize = batch, epochs = epo, steps = Int(ns),
-#     use_cuda = cuda, checkpoint = cp_derivative, norm_steps = norm_steps,
-#     types_updated = types_updated, types_noisy = types_noisy, noise_stddevs = noise_stddevs,
-#     training_strategy = DerivativeTraining()
-# )
-
-# with SolverTraining
-
 train_network(
     opt, ds_path, chk_path; mps = message_steps, layer_size = layer_size,
     hidden_layers = hidden_layers, batchsize = batch, epochs = epo, steps = Int(ns),
-    use_cuda = cuda, checkpoint = cp_solver, norm_steps = norm_steps,
+    use_cuda = cuda, checkpoint = cp_derivative, norm_steps = norm_steps,
     types_updated = types_updated, types_noisy = types_noisy, noise_stddevs = noise_stddevs,
-    training_strategy = SolverTraining(tstart, dt, tstop, solver_train)
+    training_strategy = DerivativeTraining()
 )
+
+# with SolverTraining
+
+# train_network(
+#     opt, ds_path, chk_path; mps = message_steps, layer_size = layer_size,
+#     hidden_layers = hidden_layers, batchsize = batch, epochs = epo, steps = Int(ns),
+#     use_cuda = cuda, checkpoint = cp_solver, norm_steps = norm_steps,
+#     types_updated = types_updated, types_noisy = types_noisy, noise_stddevs = noise_stddevs,
+#     training_strategy = SolverTraining(tstart, dt, tstop, solver_train)
+# )
 
 ####################
 # Evaluate network #

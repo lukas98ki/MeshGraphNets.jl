@@ -43,12 +43,13 @@ function rollout(solver, mgn::GraphNetwork, data, fields, meta, target_fields,
         target_dict, node_type, edge_features, senders, receivers, val_mask,
         inflow_mask, start, stop, dt, saves, pr = nothing)
     interval = (start, stop)
-    x0 = vcat([typeof(data[field]) <: AbstractArray ? data[field][:, :, 5] :
+    x0 = vcat([typeof(data[field]) <: AbstractArray ? data[field][:, :, 1] :
                data[field] for field in target_fields]...)
     inputs = Dict{String, AbstractArray}(
-        [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1:5]) :
+        [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1]) :
          (field, data[field]) for field in fields]
     )
+
     # inputs = reshape(inputs, :, size(inputs, 2))
     re = nothing
     if typeof(mgn.model) <: Flux.Chain
@@ -104,62 +105,37 @@ The parameter tuple contains the following variables:
 - See [ode_step](@ref).
 """
 # Todo: Entfernen des x in input zu tun. wird in ode_step gemacht
-function ode_func_train(x,
+function ode_func_train_old_for_serialized(x,
         (mgn, ps, re, data, inputs, fields, meta, target_fields, target_dict, node_type,
             edge_features, senders, receivers, val_mask, inflow_mask, strategy, pr),
         t)
-    # bx = Zygote.Buffer(x)
-    # bx[:, :, end][inflow_mask] = vcat([data[field][:, :, floor(Int, t / strategy.dt) + 1]
-    #                                    for field in target_fields]...)[inflow_mask]
-
-    # bx = Zygote.Buffer(x)
-    # bx[:, :] = x
-    # bx[inflow_mask] = vcat([data[field][:, :, floor(Int, t / strategy.dt) + 1]
-    #                         for field in target_fields]...)[inflow_mask]
-
-    # new_values = vcat([data[field][:, :, floor(Int, t / strategy.dt) + 1]
-    #                    for field in target_fields]...)
-
-    # bx[:, :, end][inflow_mask] .= new_values[inflow_mask]
-
-    ############# new test
-    # new_inputs = deepcopy(inputs)
-
     for k in target_fields
         if (ndims(inputs[k]) == 3)
             inputs[k] = vcat(eachslice(inputs[k]; dims = 3)...)
         end
 
-        # inputs[k][1:(end - 1), :] = inputs[k][2:end, :]
-
-        # inputs[k][end, :] = x[:]
-
         inputs[k] = vcat(inputs[k][2:end, :], x)
     end
-
-    # for k in target_fields
-    #     if (ndims(inputs[k]) == 3)
-    #         # Flatten von 3D auf 2D
-    #         inputs_2d = vcat(eachslice(inputs[k]; dims = 3)...)
-    #     else
-    #         inputs_2d = inputs[k]
-    #     end
-
-    #     shifted = inputs_2d[2:end, :]
-    #     new_input_k = vcat(shifted, x[:]')  # x[:] ist (n,) --> transponiert (1, n)
-
-    #     inputs[k] = new_input_k
-    # end
 
     return ode_step(x,
         (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
             node_type, edge_features, senders, receivers, val_mask, pr),
         t)
+end
 
-    # return ode_step(bx,
-    #     (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
-    #         node_type, edge_features, senders, receivers, val_mask, pr),
-    #     t)
+function ode_func_train(x,
+        (mgn, ps, re, data, inputs, fields, meta, target_fields, target_dict, node_type,
+            edge_features, senders, receivers, val_mask, inflow_mask, strategy, pr),
+        t)
+    bx = Zygote.Buffer(x)
+    bx[:, :] = x
+    bx[inflow_mask] = vcat([data[field][:, :, floor(Int, t / strategy.dt) + 1]
+                            for field in target_fields]...)[inflow_mask]
+
+    return ode_step(bx,
+        (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
+            node_type, edge_features, senders, receivers, val_mask, pr),
+        t)
 end
 
 """
@@ -193,7 +169,7 @@ The parameter tuple contains the following variables:
 ## Returns
 - See [ode_step](@ref).
 """
-function ode_func_eval(x,
+function ode_func_eval_old_for_serialize(x,
         (mgn, ps, re, data, inputs, fields, meta, target_fields, target_dict, node_type,
             edge_features, senders, receivers, val_mask, inflow_mask, saves_dt, pr),
         t)
@@ -218,6 +194,19 @@ function ode_func_eval(x,
 
         inputs[k] = new_input_k
     end
+
+    return ode_step(x,
+        (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
+            node_type, edge_features, senders, receivers, val_mask, pr),
+        t)
+end
+
+function ode_func_eval(x,
+        (mgn, ps, re, data, inputs, fields, meta, target_fields, target_dict, node_type,
+            edge_features, senders, receivers, val_mask, inflow_mask, saves_dt, pr),
+        t)
+    x[inflow_mask] = vcat([data[field][:, :, floor(Int, t / saves_dt) + 1]
+                           for field in target_fields]...)[inflow_mask]
 
     return ode_step(x,
         (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
@@ -253,7 +242,7 @@ The parameter tuple contains the following variables:
 ## Returns
 - Output of the ODE at the current timestep.
 """
-function ode_step(x,
+function ode_step_old(x,
         (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
             node_type, edge_features, senders, receivers, val_mask, pr),
         t)
@@ -315,4 +304,41 @@ function ode_step(x,
     # end
 
     # return copy(buf) .* val_mask
+end
+
+function ode_step(x,
+        (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
+            node_type, edge_features, senders, receivers, val_mask, pr),
+        t)
+    offset = 1
+    for k in target_fields
+        inputs[k] = x[offset:(offset + target_dict[k] - 1), :]
+        offset += target_dict[k]
+    end
+
+    graph = build_graph(
+        mgn, inputs, fields, 1, node_type, edge_features, senders, receivers)
+    if isnothing(re)
+        output, st = mgn.model(graph, ps, mgn.st)
+        mgn.st = st
+    else
+        output = re(ps)(graph)
+    end
+
+    indices = [meta["features"][tf]["dim"] for tf in target_fields]
+
+    buf = Zygote.Buffer(output)
+    for i in eachindex(target_fields)
+        buf[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :] = inverse_data(
+            mgn.o_norm[target_fields[i]],
+            output[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :])
+    end
+
+    @ignore_derivatives begin
+        if !isnothing(pr)
+            next!(pr; showvalues = [(:t, "$(t)")])
+        end
+    end
+
+    return copy(buf) .* val_mask
 end
