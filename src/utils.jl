@@ -177,6 +177,8 @@ function data_meanstd(path)
 
     features = ds_train.meta["feature_names"]
     target_features = ds_train.meta["target_features"]
+    edge_features = ds_train.meta["edge_features"]
+    println("edge_features: ", edge_features)
 
     result = Dict{String, Array{Float32, 2}}()
     for f in features
@@ -187,6 +189,12 @@ function data_meanstd(path)
     for tf in target_features
         if isnumber(ds_train.meta, tf)
             result["target|$tf"] = zeros(Float32, ds_train.meta["features"][tf]["dim"], 0)
+        end
+    end
+    for ef in edge_features
+        if !haskey(ds_train.meta["features"][ef], "onehot") &&
+           isnumber(ds_train.meta, ef)
+            result[ef] = zeros(Float32, ds_train.meta["features"][ef]["dim"], 0)
         end
     end
 
@@ -204,6 +212,16 @@ function data_meanstd(path)
                 result["target|$tf"] = cat(result["target|$tf"],
                     [tf_data[:, :, i] ./ Float32(data["dt"][i + 1] - data["dt"][i])
                      for i in axes(tf_data, 3)]...;
+                    dims = 2)
+            end
+        end
+
+        for ef in edge_features
+            if !haskey(ds_train.meta["features"][ef], "onehot") &&
+               isnumber(ds_train.meta, ef)
+                result[ef] = cat(
+                    result[ef], [data[ef][:, :, i]
+                                 for i in axes(data[ef], 3)]...;
                     dims = 2)
             end
         end
@@ -340,11 +358,10 @@ function print_gradients(g; prefix = "")
     end
 end
 
-function debug_training_snapshot(data, losses, gs, mgn, fields, datapoint)
+function debug_training_snapshot(
+        t::Tuple, data, losses, gs, mgn, fields, datapoint, weight_diff)
+    _, graph, target_quantities_change, mask = t
     println("\n--- DEBUG SNAPSHOT ---")
-
-    println("Loss sum: ", sum(losses))
-    println("Loss shape: ", size(losses))
 
     # Mask check
     println("Mask sum: ", sum(data["mask"]))
@@ -352,6 +369,9 @@ function debug_training_snapshot(data, losses, gs, mgn, fields, datapoint)
     println("Target shapes:")
     println("Fields of data: ", keys(data))
     println("Fields of fields: ", fields)
+
+    println("Weight diff of first five weights: ", weight_diff)
+
     target_fields = filter(f -> occursin("target|", f), keys(data))
     for tkey in target_fields
         f = replace(tkey, "target|" => "")
@@ -380,25 +400,39 @@ function debug_training_snapshot(data, losses, gs, mgn, fields, datapoint)
         println("Gradient check failed")
     end
 
-    sleep(2)
-    println("Prediction vs Target Check:")
-    # Prediction vs Target check
-    println("Gradient Check:")
-    try
-        for (i, g) in enumerate(gs.grads)
-            name = keys(gs.grads)[i]
-            val = g[2]
-            if val === nothing
-                println("Grad[$i] ($name) → nothing")
-            elseif isa(val, AbstractArray)
-                println("Grad[$i] ($name) → mean(abs) = $(mean(abs, val)), min = $(minimum(abs.(val))), max = $(maximum(abs.(val)))")
-            else
-                println("Grad[$i] ($name) → scalar = $val")
-            end
-        end
-    catch e
-        println("Gradient check failed: ", e)
-    end
+    ############# Prediction output comparison NOT WORKING
+    # output = mgn.model(graph)
+    # println("prediction mean normed: ", mean(output))
+    # buf = Zygote.Buffer(output)
+    # for i in eachindex(collect(target_fields))
+    #     buf[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :] = inverse_data(
+    #         mgn.o_norm[target_fields[i]],
+    #         output[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :])
+    # end
+    # denormed = copy(buf)
+    # println("prediction mean denormed: ", mean(denormed))
+    # println("size target: ", target_quantities_change)
+    # println("mean target: ", mean(target_quantities_change))
+    # diff = denormed .- target_quantities_change
+    # println("→ Mean prediction - target: ", mean(diff))
+    # println("→ Max abs diff: ", maximum(abs.(diff)))
+    ##################
+
+    # try
+    #     for (i, g) in enumerate(gs.grads)
+    #         name = keys(gs.grads)[i]
+    #         val = g[2]
+    #         if val === nothing
+    #             println("Grad[$i] ($name) → nothing")
+    #         elseif isa(val, AbstractArray)
+    #             println("Grad[$i] ($name) → mean(abs) = $(mean(abs, val)), min = $(minimum(abs.(val))), max = $(maximum(abs.(val)))")
+    #         else
+    #             println("Grad[$i] ($name) → scalar = $val")
+    #         end
+    #     end
+    # catch e
+    #     println("Gradient check failed: ", e)
+    # end
 
     println("--- END DEBUG ---\n")
 end

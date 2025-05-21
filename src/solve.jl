@@ -43,11 +43,13 @@ function rollout(solver, mgn::GraphNetwork, data, fields, meta, target_fields,
         target_dict, node_type, edge_features, senders, receivers, val_mask,
         inflow_mask, start, stop, dt, saves, pr = nothing)
     interval = (start, stop)
+    edge_fields = meta["edge_features"]
+    all_fields = union(fields, edge_fields)
     x0 = vcat([typeof(data[field]) <: AbstractArray ? data[field][:, :, 1] :
                data[field] for field in target_fields]...)
     inputs = Dict{String, AbstractArray}(
         [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1]) :
-         (field, data[field]) for field in fields]
+         (field, data[field]) for field in all_fields]
     )
 
     # inputs = reshape(inputs, :, size(inputs, 2))
@@ -205,8 +207,12 @@ function ode_func_eval(x,
         (mgn, ps, re, data, inputs, fields, meta, target_fields, target_dict, node_type,
             edge_features, senders, receivers, val_mask, inflow_mask, saves_dt, pr),
         t)
-    x[inflow_mask] = vcat([data[field][:, :, floor(Int, t / saves_dt) + 1]
-                           for field in target_fields]...)[inflow_mask]
+
+    # Todo: Inflow mask macht nur bei nodes Sinn. Temporär entfernen bis eine gescheite Unterscheidung eingeführt wurde
+    # x[inflow_mask] = vcat([data[field][:, :, floor(Int, t / saves_dt) + 1]
+    #                        for field in target_fields]...)[inflow_mask]
+    x = vcat([data[field][:, :, floor(Int, t / saves_dt) + 1]
+              for field in target_fields]...)
 
     return ode_step(x,
         (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
@@ -227,6 +233,7 @@ Performs a single step of the ODEProblem (see [ode_func_train](@ref) and [ode_fu
 The parameter tuple contains the following variables:
 - `mgn`: [GraphNetwork](@ref) that should be evaluated.
 - `ps`: Parameters of the network inside the MGN.
+- `re`: Reconstructor of the MGN.
 - `inputs`: Dictionary of the initial state without the target features.
 - `fields`: Node features of the MGN.
 - `meta`: Metadata of the dataset.
@@ -242,96 +249,36 @@ The parameter tuple contains the following variables:
 ## Returns
 - Output of the ODE at the current timestep.
 """
-function ode_step_old(x,
-        (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
-            node_type, edge_features, senders, receivers, val_mask, pr),
-        t)
-    # new_inputs = deepcopy(inputs)  # oder copy(), je nach Bedarf und Typ
-    offset = 1
-    # for k in target_fields
-    #     features = target_dict[k]
-    #     nodes = size(x, 2)
-
-    #     # Hole das neue Feature und reshape es auf (features, nodes, 1)
-    #     new_value = reshape(
-    #         x[offset:(offset + features - 1), :],
-    #         features, nodes, 1
-    #     )
-
-    #     # Verschiebe den "Zeitschritt-Speicher" und füge das neue sample an
-    #     # Inputs[k] ist erwartungsgemäß (features, nodes, timesteps)
-    #     # Wir verschieben: [:, :, 2:end] → entfernt den ältesten Zeitschritt
-    #     new_inputs[k] = cat(
-    #         new_inputs[k][:, :, 2:end],  # alte Werte ab zweitem timestep
-    #         new_value;                   # neue Werte
-    #         dims = 3                     # concateniere entlang der Zeitschritt-Achse
-    #     )
-
-    #     offset += features
-    # end
-
-    # Todo: datapoint was hardcoded 1, now adjusted to 5 cause of looking at more states
-    # Todo: inputs=data and data should be a trajectory, but here it is only targetfeature->nodefeature for single timestep???
-
-    graph = build_graph(
-        mgn, inputs, fields, 5, node_type, edge_features, senders, receivers)
-    if isnothing(re)
-        output, st = mgn.model(graph, ps, mgn.st)
-        mgn.st = st
-    else
-        output = re(ps)(graph)
-    end
-
-    # println("output: ", output)
-    # println("output size: ", size(output))
-    # readline()
-
-    return output .* val_mask
-
-    # indices = [meta["features"][tf]["dim"] for tf in target_fields]
-
-    # buf = Zygote.Buffer(output)
-    # for i in eachindex(target_fields)
-    #     buf[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :] = inverse_data(
-    #         mgn.o_norm[target_fields[i]],
-    #         output[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :])
-    # end
-
-    # @ignore_derivatives begin
-    #     if !isnothing(pr)
-    #         next!(pr; showvalues = [(:t, "$(t)")])
-    #     end
-    # end
-
-    # return copy(buf) .* val_mask
-end
-
 function ode_step(x,
         (mgn, ps, re, inputs, fields, meta, target_fields, target_dict,
             node_type, edge_features, senders, receivers, val_mask, pr),
         t)
     offset = 1
+
     for k in target_fields
         inputs[k] = x[offset:(offset + target_dict[k] - 1), :]
         offset += target_dict[k]
     end
-
+    # println("type of inputs[temperature]: ", typeof(inputs["temperature"]))
+    # println("typeof of inputs[m1_flow]: ", typeof(inputs["m1_flow"]))
     graph = build_graph(
-        mgn, inputs, fields, 1, node_type, edge_features, senders, receivers)
+        mgn, inputs, fields, 1, node_type, edge_features,
+        meta["edge_features"], senders, receivers)
     if isnothing(re)
-        output, st = mgn.model(graph, ps, mgn.st)
+        output_node, st = mgn.model(graph, ps, mgn.st)
         mgn.st = st
     else
-        output = re(ps)(graph)
+        output_node, output_edge = re(ps)(graph)
+        # output_node = re(ps)(graph)
     end
 
     indices = [meta["features"][tf]["dim"] for tf in target_fields]
 
-    buf = Zygote.Buffer(output)
+    buf = Zygote.Buffer(output_node)
     for i in eachindex(target_fields)
         buf[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :] = inverse_data(
             mgn.o_norm[target_fields[i]],
-            output[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :])
+            output_node[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :])
     end
 
     @ignore_derivatives begin

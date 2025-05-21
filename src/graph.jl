@@ -129,12 +129,10 @@ function build_graph_old(
 end
 
 function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer,
-        node_type, edge_features, senders::AbstractArray{T, 1},
+        node_type, edge_features, edge_fields, senders::AbstractArray{T, 1},
         receivers::AbstractArray{T, 1}) where {T <: Integer}
     nt = mgn.n_norm["node_type"](node_type)
-    # nf = CUDA.zeros(Tnf, 0, size(nt, 2))
     nf = similar(nt, 0, size(nt, 2))
-
     for field in fields
         @assert datapoint≤size(data[field], 3) "Datapoint $datapoint out of bounds for field $field"
         nf = vcat(
@@ -142,11 +140,18 @@ function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer,
     end
     nf = vcat(nf, nt)
 
-    ef = mgn.e_norm["mesh_pos"](edge_features)  # Todo: Sollte doch zwischen -1 und 1 sein? ist aber auch bei 1.7? legal?
-
-    # edge_features = convert(typeof(nf), edge_features)
-
-    # Todo: Edge_Features anpassen, Normierung ähnlich wie bei node_features
+    mesh_f = mgn.e_norm["mesh_pos"](edge_features)
+    ef = similar(mesh_f, 0, size(mesh_f, 2))
+    for field in edge_fields
+        @assert datapoint≤size(data[field], 3) "Datapoint $datapoint out of bounds for field $field"
+        if !(data[field] isa CuArray)
+            data[field] = CuArray(data[field])
+        end
+        # println("type(data[$field]): ", typeof(data[field]))
+        ef = vcat(
+            ef, mgn.e_norm[field](data[field][:, :, min(size(data[field], 3), datapoint)]))
+    end
+    ef = vcat(ef, mesh_f)
 
     return FeatureGraph(
         nf,
@@ -155,30 +160,3 @@ function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer,
         receivers
     )
 end
-
-# function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer, node_type, ef,
-#         senders::AbstractVector{T}, receivers::AbstractVector{T}) where {T <: Integer}
-#     println("Fields in build_graph: ", fields)
-#     println("Keys of data: ", keys(data))
-#     sleep(2)
-
-#     # Starte mit leerem Node-Feature-Array
-#     nf = similar(node_type, 0, size(node_type, 2))
-
-#     # Füge alle spezifizierten Features hinzu
-#     for field in fields
-#         nf = vcat(nf, data[field][:, :, min(datapoint, size(data[field], 3))])
-#     end
-
-#     # Hänge node_type als Features hinten dran
-#     nf = vcat(nf, node_type)
-
-#     println("Size of nf: ", size(nf))
-
-#     return FeatureGraph(
-#         nf,
-#         ef,
-#         senders,
-#         receivers
-#     )
-# end

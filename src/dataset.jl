@@ -133,11 +133,12 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
     end
 
     set_edges!(buffer, ds, key)
+    # Todo: maybe add mesh_pos
     if haskey(ds.meta, "edge_features")
         for ef in ds.meta["edge_features"]
-            alloc_traj!(buffer, ds, ef)
-            match_data = match_keys(ds, key, ef)    # only checks feature_names alias edge_features
-            set_traj_data!(buffer, match_data, ds, ef)
+            alloc_traj_for_edges!(buffer, ds, ef)
+            match_data = match_edge_keys(ds, key, ef)    # only checks feature_names alias edge_features
+            set_edge_feature_data!(buffer, match_data, ds, ef)
         end
     end
 
@@ -386,7 +387,8 @@ function alloc_traj_for_edges!(traj_dict::Dict{String, Any}, ds::Dataset, fn::St
     dim = haskey(ds.meta["features"][fn], "dim") ? ds.meta["features"][fn]["dim"] : 1
     n_edges = size(traj_dict["edges"], 2)
     if ds.meta["features"][fn]["type"] == "static"
-        tl = 1
+        # tl = 1
+        tl = traj_dict["trajectory_length"] # Todo: Temporary; remove later -> or remove statics to init_train_step thingy
     elseif ds.meta["features"][fn]["type"] == "dynamic"
         tl = traj_dict["trajectory_length"]
     else
@@ -546,7 +548,6 @@ function set_traj_data!(traj_dict::Dict{String, Any}, match_data, ds::Dataset, f
             else
                 idx_node = idx
             end
-
             if ds.meta["features"][fn]["type"] == "dynamic"
                 if ndims(data) == 2
                     traj_dict[fn_k][coord, idx_node, :] = data[
@@ -557,6 +558,65 @@ function set_traj_data!(traj_dict::Dict{String, Any}, match_data, ds::Dataset, f
                 end
             else
                 traj_dict[fn_k][coord, idx_node, :] .= data
+            end
+        end
+    end
+end
+
+function set_edge_feature_data!(
+        traj_dict::Dict{String, Any}, match_data, ds::Dataset, fn::String)
+    for (m, data) in match_data
+        if !occursin("]", m[1:(end - 1)])
+            coord = if haskey(ds.meta["features"][fn], "split") &&
+                       ds.meta["features"][fn]["split"]
+                Base.parse.(Int, split(split(m, r"(\[|\])")[2], ","))
+            else
+                Colon()
+            end
+
+            fn_k = occursin(".ev", m) ? "$fn.ev" : fn
+
+            if ds.meta["features"][fn]["type"] == "dynamic"
+                if ndims(data) == 2
+                    traj_dict[fn_k][coord, :, :] = data[
+                        coord, 1:traj_dict["trajectory_length"]]
+                else
+                    traj_dict[fn_k][coord, :, :] = data[1:traj_dict["trajectory_length"]]
+                end
+            else
+                traj_dict[fn_k][coord, :, :] .= data
+            end
+
+        else
+            idx_edge = Base.parse.(Int, split(split(m, r"(\[|\])")[2], ","))
+            if haskey(ds.meta["features"][fn], "split") &&
+               ds.meta["features"][fn]["split"]
+                coord = Base.parse.(Int, split(split(m, r"(\[|\])")[4], ","))
+            else
+                coord = Colon()
+            end
+
+            fn_k = occursin(".ev", m) ? "$fn.ev" : fn
+
+            if !isa(idx_edge, AbstractArray)
+                idx_edge = [idx_edge]
+            end
+
+            if ds.meta["features"][fn]["type"] == "dynamic"
+                if ndims(data) == 2
+                    traj_dict[fn_k][coord, idx_edge, :] = data[
+                        coord, 1:traj_dict["trajectory_length"]]
+                else
+                    traj_dict[fn_k][coord, idx_edge, :] = data[1:traj_dict["trajectory_length"]]
+                end
+            else
+                if ndims(data) == 2
+                    traj_dict[fn_k][coord, idx_edge, :] .= data
+                elseif ndims(data) == 1
+                    traj_dict[fn_k][coord, idx_edge, :] .= reshape(data, :, 1)
+                else
+                    traj_dict[fn_k][coord, idx_edge, :] .= data
+                end
             end
         end
     end
@@ -611,6 +671,9 @@ function set_edges!(traj_dict::Dict{String, Any}, ds::Dataset, key::String)
                         ds.meta["no_edges_node_types"] : [],
                         haskey(ds.meta, "exclude_node_indices") ?
                         ds.meta["exclude_node_indices"] : [])
+                    # println("type edges: ", typeof(traj_dict["edges"]))
+                    # traj_dict["edges"] = parse_custom_edges_checked_bidirectional(edges)
+                    # println("type edges: ", typeof(traj_dict["edges"]))
                 else
                     throw(ArgumentError("The metadata \"type\" of metadata \"edges\" is invalid. Possible values are: [\"cells\" for cell-type edge structures, \"dims\" for fixed edges along the dimensions, \"custom\" for custom edges]"))
                 end
@@ -732,6 +795,7 @@ end
     parse_custom_edges(edges, node_type, no_edges_node_types, exclude_node_indices)
 
 Parses the edges that were read from the datafile. The format is a vector of pairs of node indices that represent edges.
+Is correct if all bidirectional edges are present, i.e. if the edge `[1, 2]` is present, the edge `[2, 1]` must also be present.
 
 ## Arguments
 - `edges`: Vector of pairs of node indices. (not nx2-matrix, but really n pairs)
@@ -742,7 +806,8 @@ Parses the edges that were read from the datafile. The format is a vector of pai
 ## Returns
 - Two-dimensional array of edges as pairs of node indices.
 """
-function parse_custom_edges(edges, node_type, no_edges_node_types, exclude_node_indices)
+function parse_custom_edges(
+        edges, node_type, no_edges_node_types, exclude_node_indices)
     if edges isa Matrix{Int64}
         edges = collect(eachrow(edges))  # Umwandeln in Vector von Arrays
     end
@@ -753,7 +818,27 @@ function parse_custom_edges(edges, node_type, no_edges_node_types, exclude_node_
     for edge in filtered_edges
         push!(edge_vec, [edge[1], edge[2]])
     end
-    return hcat(sort(edge_vec)...)
+    return hcat((edge_vec)...)
+end
+
+# Schaut ob bereits bidirektionale Kanten vorhanden sind. Falls ja, alles gut. Falls nein -> error
+# Todo: edge_Features anpassen?!
+function parse_custom_edges_checked_bidirectional(edges)
+    if edges isa Matrix{Int}
+        edges_vec = [Tuple(row) for row in eachrow(edges)]
+    else
+        edges_vec = edges
+    end
+
+    edge_set = Set(edges_vec)
+
+    for (a, b) in edge_set
+        if (b, a) ∉ edge_set
+            error("Edge set is not bidirectional: missing edge ($b, $a)")
+        end
+    end
+
+    return hcat([collect(e) for e in edges_vec]...) .|> Int32
 end
 
 """
