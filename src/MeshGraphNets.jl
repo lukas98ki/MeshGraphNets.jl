@@ -56,7 +56,7 @@ export train_network, eval_network, data_minmax, data_meanstd
     solver_valid_dt::Union{Nothing, Float32} = nothing
     wandb_logger = nothing
     reset_valid::Bool = false
-    backend::Symbol = :Flux
+    backend::Symbol = :Lux
 end
 
 struct NormaliserIdentity
@@ -104,7 +104,7 @@ function calc_norms(dataset, device, args::Args)
                             Float32(dataset.meta["features"][ef]["output_std"]))
                     else
                         o_norms[ef] = NormaliserOnline(
-                            dataset.meta["features"][feature]["dim"],
+                            dataset.meta["features"][ef]["dim"],
                             device; max_acc = Float32(args.max_norm_steps))
                     end
                 end
@@ -152,11 +152,15 @@ function calc_norms(dataset, device, args::Args)
                 e_norms[ef] = NormaliserOnline(
                     dataset.meta["features"][ef]["dim"],
                     device; max_acc = Float32(args.max_norm_steps))
+                if ef in dataset.meta["target_features"]
+                    o_norms[ef] = NormaliserOnline(
+                        dataset.meta["features"][ef]["dim"],
+                        device; max_acc = Float32(args.max_norm_steps))
+                end
             end
         end
     end
     if haskey(dataset.meta, "edges")
-        println("Sind doch bei edges drin :( ")
         if haskey(dataset.meta["edges"], "data_min") &&
            haskey(dataset.meta["edges"], "data_max")
             e_norms["mesh_pos"] = NormaliserOfflineMinMax(
@@ -405,10 +409,24 @@ function train_network(opt, ds_path, cp_path; kws...)
     ef_size += dims + 1 # Todo: Mesh_pos + 1 for distance; hopefully will end up in edge_features one day
 
     # nf_size = nf_size + 4   # Todo: Garbage coding! done because we serialize 4 extra timesteps es input_features # removed since we dont serialize with House_mesh
-    outputs = 0
-    for tf in ds_train.meta["target_features"]
-        outputs += ds_train.meta["features"][tf]["dim"]
+    target_edge_features = intersect(
+        ds_train.meta["target_features"], ds_train.meta["edge_features"])
+    target_node_features = intersect(
+        ds_train.meta["target_features"], ds_train.meta["feature_names"])
+    # Need minimum of 1 for the output layer -> if we have no target, it will simply be a dummy layer (not considered in loss calculation)
+    if length(target_node_features) > 0
+        outputs_node = sum(ds_train.meta["features"][nf]["dim"]
+        for nf in target_node_features)
+    else
+        outputs_node = 1
     end
+    if length(target_edge_features) > 0
+        outputs_edge = sum(ds_train.meta["features"][ef]["dim"]
+        for ef in target_edge_features)
+    else
+        outputs_edge = 1
+    end
+    outputs = (outputs_node, outputs_edge)
 
     mgn, opt_state, df_train, df_valid = GraphNetCore.load_(
         nf_size, ef_size,
@@ -583,7 +601,7 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                     desc = "Validation progress: ", barlen = 50)
                 print("\n\n\n\n\n\n\n")
 
-                for data_valid in Iterators.take(valid_loader, 3)
+                for data_valid in Iterators.take(valid_loader, 2)
                     print("\n\n\n")
                     pr_solver = ProgressUnknown(;
                         desc = "Trajectory $(traj_idx)/$(length(valid_loader)): ",
@@ -717,10 +735,24 @@ function eval_network(ds_path, cp_path::String, out_path::String, solver = nothi
         ef_size = dims + 1
     end
 
-    outputs = 0
-    for tf in ds_test.meta["target_features"]
-        outputs += ds_test.meta["features"][tf]["dim"]
+    target_edge_features = intersect(
+        ds_test.meta["target_features"], ds_test.meta["edge_features"])
+    target_node_features = intersect(
+        ds_test.meta["target_features"], ds_test.meta["feature_names"])
+    # Need minimum of 1 for the output layer -> if we have no target, it will simply be a dummy layer (not considered in loss calculation)
+    if length(target_node_features) > 0
+        outputs_node = sum(ds_test.meta["features"][nf]["dim"]
+        for nf in target_node_features)
+    else
+        outputs_node = 1
     end
+    if length(target_edge_features) > 0
+        outputs_edge = sum(ds_test.meta["features"][ef]["dim"]
+        for ef in target_edge_features)
+    else
+        outputs_edge = 1
+    end
+    outputs = (outputs_node, outputs_edge)
 
     mgn, _, _, _ = load_(
         nf_size, ef_size, e_norms,
@@ -779,6 +811,11 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
             target_dict[tf] = ds_test.meta["features"][tf]["dim"]
         end
 
+        target_node_features = intersect(
+            ds_test.meta["target_features"], ds_test.meta["feature_names"])
+        target_edge_features = intersect(ds_test.meta["target_features"],
+            ds_test.meta["edge_features"])
+
         pr = ProgressUnknown(;
             desc = "Trajectory $ti/$(length(test_loader)): ", showspeed = true)
 
@@ -788,19 +825,66 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
             data["receivers"], data["val_mask"], data["inflow_mask"], start, stop, dt,
             saves, pr)
 
-        prediction = cat(sol_u...; dims = 3)
-        error = mean(
-            (prediction -
-             vcat([data[field][:, :, 1:length(saves)]
-                   for field in ds_test.meta["target_features"]]...)) .^
-            2;
-            dims = 2)
+        if length(target_node_features) != 0 && length(target_edge_features) != 0
+            n_timesteps = length(sol_u)
+            gt = vcat([data[tf] for tf in target_node_features]...)[
+                :, :, 1:length(saves)]
+            gt_e = vcat([data[ef] for ef in target_edge_features]...)[
+                :, :, 1:length(saves)]
+            node_preds_unshaped = [sol_u[t].node for t in 1:n_timesteps]
+            prediction = cat(node_preds_unshaped...; dims = 3)
+
+            edge_preds_unshaped = [sol_u[t].edge for t in 1:n_timesteps]
+            edge_preds = cat(edge_preds_unshaped...; dims = 3)
+
+            traj_ops[(ti, "gt_edge")] = cpu_device()(gt_e)
+            traj_ops[(ti, "prediction_edge")] = cpu_device()(edge_preds)
+
+            error = cpu_device()(mean(abs2, prediction - gt; dims = (1, 2))[1, 1, :])
+            error_edge = cpu_device()(
+                mean(
+                abs2, edge_preds - vcat([data[ef] for ef in target_edge_features]...);
+                dims = (1, 2))[1, 1, :])
+        else
+            gt = vcat([data[tf] for tf in ds_test.meta["target_features"]]...)[
+                :, :, 1:length(saves)]
+            prediction = cat(sol_u...; dims = 3)
+            error = cpu_device()(mean(abs2, prediction - gt; dims = (1, 2))[1, 1, :])
+        end
+
+        # sol_u, sol_t = rollout(
+        #     solver, mgn, data, fields, ds_test.meta, ds_test.meta["target_features"],
+        #     target_dict, data["node_type"], data["mesh_features"], data["senders"],
+        #     data["receivers"], data["val_mask"], data["inflow_mask"], start, stop, dt,
+        #     saves, pr)
+
+        # n_timesteps = length(sol_u)
+
+        # node_preds_unshaped = [sol_u[t].node for t in 1:n_timesteps]
+        # prediction = cat(node_preds_unshaped...; dims = 3)
+
+        # edge_preds_unshaped = [sol_u[t].edge for t in 1:n_timesteps]
+        # edge_preds = cat(edge_preds_unshaped...; dims = 3)
+        # prediction = cat(sol_u...; dims = 3)
+
+        # error = cpu_device()(mean(abs2, prediction - gt; dims = (1, 2))[1, 1, :])
+
+        # pr2 = nothing
+
+        # sol_u, sol_t = rollout(
+        #     solver, mgn, data, fields, ds_test.meta, target_edge_features,
+        #     target_dict, data["node_type"], data["mesh_features"], data["senders"],
+        #     data["receivers"], data["val_mask"], data["inflow_mask"], start, stop, dt,
+        #     saves, pr2)
+
+        # prediction_edge = cat(sol_u...; dims = 3)
+
         timesteps[(ti, "timesteps")] = sol_t
 
         println("MSE of state prediction:")
         for horizon in mse_steps
-            err = mean(error[:, 1, findfirst(x -> x == horizon, saves)])
-            cum_err = mean(error[:, 1, 1:findfirst(x -> x == horizon, saves)])
+            err = error[findfirst(x -> x == horizon, saves)]
+            cum_err = mean(error[1:findfirst(x -> x == horizon, saves)])
             if cum_err > cum_mse_return
                 cum_mse_return = cum_err
             end
@@ -808,9 +892,7 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
         end
 
         traj_ops[(ti, "mesh_pos")] = cpu_device()(data["mesh_pos"])
-        traj_ops[(ti, "gt")] = cpu_device()(vcat([data[field][
-                                                      :, :, 1:size(prediction, 3)]
-                                                  for field in ds_test.meta["target_features"]]...))
+        traj_ops[(ti, "gt")] = cpu_device()(gt)
         traj_ops[(ti, "prediction")] = cpu_device()(prediction)
         errors[(ti, "error")] = cpu_device()(error[:, 1, :])
         edges[(ti, "edges")] = cpu_device()(permutedims(hcat(

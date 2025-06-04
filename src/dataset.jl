@@ -146,25 +146,44 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
 
     prepare_trajectory!(buffer, ds.meta, ds.meta["device"])
 
+    target_node_features = intersect(
+        ds.meta["target_features"], ds.meta["feature_names"])
+
     buffer["mask"] = Int32.(findall(
         x -> x in ds.meta["types_updated"], buffer["node_type"][1, :, 1])) |>
                      ds.meta["device"]
 
     buffer["val_mask"] = Float32.(map(
         x -> x in ds.meta["types_updated"], buffer["node_type"][:, :, 1]))
-    buffer["val_mask"] = repeat(
-        buffer["val_mask"], sum(size(buffer[field], 1)
-        for field in ds.meta["target_features"]), 1) |>
-                         ds.meta["device"]
 
-    buffer["inflow_mask"] = repeat(buffer["node_type"][:, :, 1] .== 1,
-        sum(size(buffer[field], 1) for field in ds.meta["target_features"]), 1) |>
-                            ds.meta["device"]
+    n_target_node = isempty(target_node_features) ? 0 :
+                    sum(size(buffer[field], 1) for field in target_node_features)
+
+    if n_target_node > 0
+        buffer["val_mask"] = Float32.(map(
+            x -> x in ds.meta["types_updated"], buffer["node_type"][:, :, 1]))
+        buffer["val_mask"] = repeat(buffer["val_mask"], n_target_node, 1) |>
+                             ds.meta["device"]
+        buffer["inflow_mask"] = repeat(
+            buffer["node_type"][:, :, 1] .== 1, n_target_node, 1) |> ds.meta["device"]
+    else
+        buffer["val_mask"] = zeros(Float32, 0, size(buffer["node_type"], 2)) |>
+                             ds.meta["device"]
+        buffer["inflow_mask"] = zeros(Bool, 0, size(buffer["node_type"], 2)) |>
+                                ds.meta["device"]
+    end
+
+    # buffer["val_mask"] = repeat(
+    #     buffer["val_mask"], sum(size(buffer[field], 1)
+    #     for field in target_node_features), 1) |>
+    #                      ds.meta["device"]
+
+    # buffer["inflow_mask"] = repeat(buffer["node_type"][:, :, 1] .== 1,
+    #     sum(size(buffer[field], 1) for field in target_node_features), 1) |>
+    #                         ds.meta["device"]
 
     create_base_graph!(buffer, ds.meta["features"]["node_type"]["data_max"],
         ds.meta["features"]["node_type"]["data_min"], ds.meta["device"])
-
-    # println("Buffer keys: ", keys(buffer))
 
     return buffer
 end
@@ -942,7 +961,7 @@ function prepare_trajectory!(data, meta, device::Function)
         add_targets!(data, meta["target_features"], device)
         preprocess!(data, meta["target_features"], meta["noise_stddevs"],
             meta["types_noisy"], meta["training_strategy"], device)
-        for field in meta["feature_names"]
+        for field in union(meta["feature_names"], meta["edge_features"])
             if field == "mesh_pos" || field == "node_type" || field == "cells" ||
                field in meta["target_features"]
                 continue
@@ -950,7 +969,7 @@ function prepare_trajectory!(data, meta, device::Function)
             data[field] = device(data[field])
         end
     else
-        for field in meta["feature_names"]
+        for field in union(meta["feature_names"], meta["edge_features"])
             if field == "mesh_pos" || field == "node_type" || field == "cells"
                 continue
             end
@@ -986,28 +1005,28 @@ function set_edge_features!(buffer, ds::Dataset, key::String)
                         if haskey(traj, "edge[1].$edge_feature")
                             data = [traj["edge[$i].$edge_feature"] for i in 1:n_edges]
                             # buffer["edge[$i]." * edge_feature] = traj["edge[$i]." * edge_feature]
-                            buffer["edge|" * edge_feature] = permutedims(
-                                hcat(data...), (2, 1))  # (n_edges, Zeitpunkte)
+                            buffer["edge|" * edge_feature] = device(permutedims(
+                                hcat(data...), (2, 1)))  # (n_edges, Zeitpunkte)
                             println(
                                 "Size edge_feature: ", size(buffer["edge|" * edge_feature]))
                         elseif haskey(traj, edge_feature)
-                            buffer["edge|" * edge_feature] = traj[edge_feature] # (n_edges, 1) ?
+                            buffer["edge|" * edge_feature] = device(traj[edge_feature]) # (n_edges, 1) ?
                             println("Size static edge_feautre: ", traj[edge_feature])
                         else
                             println("Edge Feature $edge_feature fehlt, Standardwerte werden genutzt.")
-                            buffer["edge|" * edge_feature] = ones(
-                                Float32, size(buffer["edges"], 2), 1)
+                            buffer["edge|" * edge_feature] = device(ones(
+                                Float32, size(buffer["edges"], 2), 1))
                         end
                     end
                 else
                     h5open(ds.datafile, "r") do file
                         traj = open_group(file, key)
                         if haskey(traj, edge_feature)
-                            buffer[edge_feature] = Base.read(traj, edge_feature)
+                            buffer[edge_feature] = device(Base.read(traj, edge_feature))
                         else
                             println("Edge Feature $edge_feature fehlt, Standardwerte werden genutzt.")
-                            buffer[edge_feature] = ones(
-                                Float32, size(buffer["edges"], 2), 1)
+                            buffer[edge_feature] = device(ones(
+                                Float32, size(buffer["edges"], 2), 1))
                         end
                     end
                 end

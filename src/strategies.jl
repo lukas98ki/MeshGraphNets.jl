@@ -5,6 +5,7 @@
 
 import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction
 import SciMLSensitivity: InterpolatingAdjoint, ZygoteVJP
+using ComponentArrays: ComponentArray, ComponentVector
 
 #######################################################
 # Abstract type and functions for training strategies #
@@ -122,22 +123,51 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
         gt_node = vcat([data[tf] for tf in target_node_fields]...)[:, :, data_interval]
         gt_edge = vcat([data[tf] for tf in target_edge_fields]...)[:, :, data_interval]
         sol_u, _ = rollout(
-            solver, mgn, data, fields, meta, target_node_fields, target_dict,
+            solver, mgn, data, fields, meta, target_fields, target_dict,
             node_type, edge_features, senders, receivers, val_mask, inflow_mask,
             sim_interval[1], sim_interval[end], solver_dt, sim_interval, pr)
-        # Todo: rollout for edge
+
+        n_timesteps = length(sol_u)
+        node_preds_unshaped = [sol_u[t].node for t in 1:n_timesteps]
+        node_preds = cat(node_preds_unshaped...; dims = 3)
+
+        edge_preds_unshaped = [sol_u[t].edge for t in 1:n_timesteps]
+        edge_preds = cat(edge_preds_unshaped...; dims = 3)
+
+        println("mean gt_node: ", mean(gt_node))
+        println("mean node_preds: ", mean(node_preds))
+        println("mean gt_edge: ", mean(gt_edge))
+        println("mean edge_preds: ", mean(edge_preds))
+
+        error_node = mean((node_preds - gt_node) .^ 2; dims = 3)
+        error_edge = mean((edge_preds - gt_edge) .^ 2; dims = 3)
+        println("error node: ", mean(error_node[mask]), " error edge: ", mean(error_edge))
+        return mean(error_node[mask]) + mean(error_edge)
     elseif length(target_node_fields) != 0
         gt_node = vcat([data[tf] for tf in target_node_fields]...)[:, :, data_interval]
         sol_u, _ = rollout(
             solver, mgn, data, fields, meta, target_node_fields, target_dict,
             node_type, edge_features, senders, receivers, val_mask, inflow_mask,
             sim_interval[1], sim_interval[end], solver_dt, sim_interval, pr)
+        prediction = cat(sol_u...; dims = 3)[:, :, data_interval]
+
+        error = mean((prediction - gt_node) .^ 2; dims = 3)
+        # Todo: error for edge
+
+        return mean(error[mask])
+
     elseif length(target_edge_fields) != 0
         gt_edge = vcat([data[tf] for tf in target_edge_fields]...)[:, :, data_interval]
         sol_u, _ = rollout(
             solver, mgn, data, fields, meta, target_edge_fields, target_dict,
             node_type, edge_features, senders, receivers, val_mask, inflow_mask,
             sim_interval[1], sim_interval[end], solver_dt, sim_interval, pr)
+        prediction = cat(sol_u...; dims = 3)[:, :, data_interval]
+
+        error = mean((prediction - gt_edge) .^ 2; dims = 3)
+        # Todo: error for edge
+
+        return mean(error)
     else
         throw(ArgumentError("No target features found!"))
     end
@@ -168,6 +198,9 @@ end
 function init_train_step(::SolverStrategy, t::Tuple, ta::Tuple)
     mgn, data, meta, fields, target_fields, node_type, edge_features, senders, receivers, _, idx_mask, val_mask = t
 
+    target_edge_fields = intersect(target_fields, meta["edge_features"])
+    target_node_fields = intersect(target_fields, meta["feature_names"])
+
     edge_fields = meta["edge_features"]
     all_fields = vcat(fields, edge_fields)
 
@@ -175,12 +208,34 @@ function init_train_step(::SolverStrategy, t::Tuple, ta::Tuple)
     for tf in meta["target_features"]
         target_dict[tf] = meta["features"][tf]["dim"]
     end
+    # Mixed input array -> diffentiate later between node and edge features
     inputs = Dict{String, AbstractArray}(
         [typeof(data[field]) <: AbstractArray ? (field, data[field][:, :, 1]) :
          (field, data[field]) for field in all_fields]
     )
-    gt = vcat([data[tf] for tf in meta["target_features"]]...)
-    u0 = gt[:, :, 1]    # Todo: Hardcoded adjustment for initial 5 steps instead of one
+    # define gt if target fields are given, else init empty array
+    gt_node = isempty(target_node_fields) ? Array{Float32}(undef, 0, 0, 0) :
+              vcat([data[tf] for tf in target_node_fields]...)
+    gt_edge = isempty(target_edge_fields) ? Array{Float32}(undef, 0, 0, 0) :
+              vcat([data[tf] for tf in target_edge_fields]...)
+
+    u0_node = size(gt_node, 3) > 0 ? gt_node[:, :, 1] : Array{Float32}(undef, 0, 0)
+    u0_edge = size(gt_edge, 3) > 0 ? gt_edge[:, :, 1] : Array{Float32}(undef, 0, 0)
+
+    if !isempty(target_node_fields) && !isempty(target_edge_fields)
+        u0 = ComponentArray(; node = copy(u0_node), edge = copy(u0_edge))
+        gt = ComponentArray(;
+            node = copy(gt_node), edge = copy(gt_edge))
+    elseif !isempty(target_node_fields)
+        u0 = u0_node
+        gt = gt_node
+    elseif !isempty(target_edge_fields)
+        u0 = u0_edge
+        gt = gt_edge
+    else
+        throw(ArgumentError("No target features found!"))
+    end
+
     return (mgn, data, inputs, fields, meta, target_fields, target_dict,
         node_type, edge_features, senders, receivers, idx_mask, val_mask, u0, gt)
 end
@@ -192,18 +247,22 @@ function train_step(strategy::SolverStrategy, t::Tuple)
     if typeof(mgn.model) <: Flux.Chain
         mgn.ps, re = Flux.destructure(mgn.model)
     end
+    target_node_fields = intersect(target_fields, meta["feature_names"])
+    target_edge_fields = intersect(target_fields, meta["edge_features"])
+
     ff = ODEFunction{false}((x, p, t) -> ode_func_train(x,
         (mgn, p, re, data, inputs, fields, meta,
             target_fields, target_dict, node_type,
-            edge_features, senders, receivers, val_mask, data["inflow_mask"], strategy, pr),
+            edge_features, senders, receivers, val_mask, data["inflow_mask"],
+            strategy, pr, target_node_fields, target_edge_fields),
         t))
 
     prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), mgn.ps)
 
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps -> train_loss(strategy,
-            (prob, ps, u0, nothing, gt, val_mask, mgn.n_norm, target_fields,
-                [meta["features"][tf]["dim"] for tf in target_fields])),
+            (prob, ps, u0, nothing, gt, val_mask, mgn, target_fields,
+                [meta["features"][tf]["dim"] for tf in target_fields], target_node_fields, target_edge_fields)),
         mgn.ps)
     return shoot_gs, shoot_loss
 end
@@ -280,65 +339,107 @@ function train_loss_in_serialization(strategy::SolverTraining, t::Tuple)
 end
 
 function train_loss(strategy::SolverTraining, t::Tuple)
-    prob, ps, u0, callback_solve, gt, val_mask, n_norm, target_fields, target_dims = t
+    prob, ps, u0, callback_solve, gt, val_mask, mgn, target_fields, target_dims, target_node_fields, target_edge_fields = t
 
     sol = solve(remake(prob; p = ps), strategy.solver; u0 = u0,
         saveat = (strategy.tstart):(strategy.dt):(strategy.tstop),
         tstops = (strategy.tstart):(strategy.dt):(strategy.tstop),
         sensealg = strategy.sense, callback = callback_solve, strategy.solargs...)
 
-    pred = typeof(gt) <: CuArray ? CuArray(sol) : Array(sol)
+    if length(target_node_fields) != 0 && length(target_edge_fields) != 0
+        n_timesteps = length(sol)
 
-    local gt_n
-    local pred_n
+        n_node_features, n_nodes = size(gt.node)[1:2]
+        n_edge_features, n_edges = size(gt.edge)[1:2]
 
-    # Wirft stack overflow fehler bei länge von 502 in trajektorie
-    # for i in eachindex(target_fields)
-    #     gt_n = vcat(
-    #         [cat(
-    #              [n_norm[target_fields[i]](gt[
-    #                   (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
-    #               for ts in axes(pred, 3)]...; dims = 3
-    #          ) for i in eachindex(target_fields)]...
-    #     )
-    #     pred_n = vcat(
-    #         [cat(
-    #              [n_norm[target_fields[i]](pred[
-    #                   (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
-    #               for ts in axes(pred, 3)]...; dims = 3
-    #          ) for i in eachindex(target_fields)]...
-    #     )
-    # end
-    gt_n = vcat(
-        [reduce((x, y) -> cat(x, y; dims = 3),
-             [n_norm[target_fields[i]](gt[
-                  (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
-              for ts in axes(pred, 3)])
-         for i in eachindex(target_fields)]...
-    )
+        node_preds_unshaped = [sol[t].node for t in 1:n_timesteps]
+        node_preds = cat(node_preds_unshaped...; dims = 3)   # shape: (n_node_features, n_nodes, n_timesteps)
 
-    pred_n = vcat(
-        [reduce((x, y) -> cat(x, y; dims = 3),
-             [n_norm[target_fields[i]](pred[
-                  (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
-              for ts in axes(pred, 3)])
-         for i in eachindex(target_fields)]...
-    )
+        edge_preds_unshaped = [sol[t].edge for t in 1:n_timesteps]
+        edge_preds = cat(edge_preds_unshaped...; dims = 3)   # shape: (n_edge_features, n_edges, n_timesteps)
 
-    # println("gt:    min=$(minimum(gt[:, 3, :])), max=$(maximum(gt[:, 3, :])), mean=$(mean(gt[:, 3, :]))")
-    # println("gt_n:  min=$(minimum(gt_n[:, 3, :])), max=$(maximum(gt_n[:, 3, :])), mean=$(mean(gt_n[:, 3, :]))")
+        normed_pred_n = cat(
+            [mgn.n_norm[target_node_fields[i]](node_preds[i, :, :])
+             for i in 1:n_node_features]...;
+            dims = 1
+        )
+        normed_gt_n = cat(
+            [mgn.n_norm[target_node_fields[i]](gt.node[i, :, :])
+             for i in 1:n_node_features]...;
+            dims = 1
+        )
 
-    error = (gt_n[:, :, 1:size(pred, 3)] .- pred_n) .^ 2 |> cpu_device()    # Todo: remove ^2 add abs()
+        normed_pred_e = cat(
+            [mgn.e_norm[target_edge_fields[i]](edge_preds[i, :, :])
+             for i in 1:n_edge_features]...;
+            dims = 1
+        )
+        normed_gt_e = cat(
+            [mgn.e_norm[target_edge_fields[i]](gt.edge[i, :, :])
+             for i in 1:n_edge_features]...;
+            dims = 1
+        )
 
-    err_buf = Zygote.Buffer(error)
+        error_n = (normed_pred_n .- normed_gt_n) .^ 2 |> cpu_device()
+        error_e = (normed_pred_e .- normed_gt_e) .^ 2 |> cpu_device()
 
-    vm = cpu_device()(val_mask)
+        vm = cpu_device()(val_mask)
+        masked_error_n = error_n .* vm'
 
-    err_buf[:, :, :] = error
-    for i in axes(err_buf, 3)
-        err_buf[:, :, i] = err_buf[:, :, i] .* vm
+        loss = mean(copy(masked_error_n)) + mean(copy(error_e))
+    else
+        pred = typeof(gt) <: CuArray ? CuArray(sol) : Array(sol)
+
+        local gt_n
+        local pred_n
+        println("type gt: ", typeof(gt))
+        for i in eachindex(target_fields)
+            if length(target_node_fields) != 0
+                pred_n = vcat([mgn.n_norm[target_fields[i]](pred[
+                                   (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, :])
+                               for i in eachindex(target_fields)]...)
+                println("size slice: ",
+                    gt[
+                        (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
+                        :, 1:size(pred, 3)])
+                gt_n = vcat([mgn.n_norm[target_fields[i]](gt[
+                                 (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
+                                 :, 1:size(pred, 3)]) for i in eachindex(target_fields)]...)
+
+            else
+                gt_n = vcat([mgn.e_norm[target_fields[i]](gt[
+                                 (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
+                                 :, 1:size(pred, 3)]) for i in eachindex(target_fields)]...)
+                pred_n = vcat([mgn.e_norm[target_fields[i]](pred[
+                                   (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, :])
+                               for i in eachindex(target_fields)]...)
+            end
+        end
+
+        error = (gt_n[:, :, 1:size(pred, 3)] .- pred_n) .^ 2 |> cpu_device()
+
+        if length(target_node_fields) != 0
+            err_buf = Zygote.Buffer(error)
+
+            vm = cpu_device()(val_mask)
+
+            err_buf[:, :, :] = error
+            for i in axes(err_buf, 3)
+                err_buf[:, :, i] = err_buf[:, :, i] .* vm
+            end
+            loss = mean(copy(err_buf))
+        end
     end
-    loss = mean(copy(err_buf))
+
+    # println("Debugs")
+    # println("mean node_preds: ", mean(node_preds))
+    # println("mean edge_preds: ", mean(edge_preds))
+    # println("mean normed_pred_n: ", mean(normed_pred_n))
+    # println("mean normed_gt_n: ", mean(normed_gt_n))
+    # println("mean normed_pred_e: ", mean(normed_pred_e))
+    # println("mean error_n: ", mean(masked_error_n))
+    # println("mean error_e: ", mean(error_e))
+    # println("loss: ", loss)
 
     return loss
 end
@@ -450,6 +551,7 @@ function init_train_step(::DerivativeStrategy, t::Tuple, ::Tuple)
     target_edge_fields = intersect(target_fields, meta["edge_features"])
     target_node_fields = intersect(target_fields, meta["feature_names"])
 
+    # Currently output is not normed in loss function -> so here no norming either
     target_quantities_change_node = vcat([mgn.o_norm[field]((data["target|" * field][
                                               :, :, datapoint] -
                                                              data[field][:, :, datapoint]) /
@@ -463,6 +565,20 @@ function init_train_step(::DerivativeStrategy, t::Tuple, ::Tuple)
                                                             (data["dt"][datapoint + 1] -
                                                              data["dt"][datapoint]))
                                           for field in target_edge_fields]...)
+
+    # target_quantities_change_node = vcat([((data["target|" * field][
+    #                                           :, :, datapoint] -
+    #                                         data[field][:, :, datapoint]) /
+    #                                        (data["dt"][datapoint + 1] -
+    #                                         data["dt"][datapoint]))
+    #                                       for field in target_node_fields]...)
+
+    # target_quantities_change_edge = vcat([((data["target|" * field][
+    #                                           :, :, datapoint] -
+    #                                         data[field][:, :, datapoint]) /
+    #                                        (data["dt"][datapoint + 1] -
+    #                                         data["dt"][datapoint]))
+    #                                       for field in target_edge_fields]...)
 
     target_quantities_change = (target_quantities_change_node,
         target_quantities_change_edge)

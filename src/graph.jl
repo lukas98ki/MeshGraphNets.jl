@@ -147,11 +147,10 @@ function build_graph(mgn::GraphNetwork, data, fields, datapoint::Integer,
         if !(data[field] isa CuArray)
             data[field] = CuArray(data[field])
         end
-        # println("type(data[$field]): ", typeof(data[field]))
         ef = vcat(
             ef, mgn.e_norm[field](data[field][:, :, min(size(data[field], 3), datapoint)]))
     end
-    ef = vcat(ef, mesh_f)
+    ef = vcat(mesh_f, ef)   # Mesh is normed already
 
     return FeatureGraph(
         nf,
