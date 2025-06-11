@@ -492,7 +492,7 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
 
     local tmp_loss = 0.0f0
     local avg_loss = 0.0f0
-    # Todo: Wouldnt it be cleaner to delete all static fields?
+
     fields = deleteat!(copy(ds_train.meta["feature_names"]),
         findall(x -> x == "node_type" || x == "mesh_pos" || x == "cells",
             ds_train.meta["feature_names"]))
@@ -601,7 +601,7 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                     desc = "Validation progress: ", barlen = 50)
                 print("\n\n\n\n\n\n\n")
 
-                for data_valid in Iterators.take(valid_loader, 2)
+                for data_valid in Iterators.take(valid_loader, 10)
                     print("\n\n\n")
                     pr_solver = ProgressUnknown(;
                         desc = "Trajectory $(traj_idx)/$(length(valid_loader)): ",

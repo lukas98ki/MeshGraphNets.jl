@@ -398,10 +398,6 @@ function train_loss(strategy::SolverTraining, t::Tuple)
                 pred_n = vcat([mgn.n_norm[target_fields[i]](pred[
                                    (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, :])
                                for i in eachindex(target_fields)]...)
-                println("size slice: ",
-                    gt[
-                        (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
-                        :, 1:size(pred, 3)])
                 gt_n = vcat([mgn.n_norm[target_fields[i]](gt[
                                  (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
                                  :, 1:size(pred, 3)]) for i in eachindex(target_fields)]...)
