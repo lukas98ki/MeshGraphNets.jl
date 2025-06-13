@@ -152,7 +152,9 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
         prediction = cat(sol_u...; dims = 3)[:, :, data_interval]
 
         error = mean((prediction - gt_node) .^ 2; dims = 3)
-        # Todo: error for edge
+        println("mean gt_node: ", mean(gt_node))
+        println("mean pred: ", mean(prediction))
+        println("mean error: ", mean(error[mask]))
 
         return mean(error[mask])
 
