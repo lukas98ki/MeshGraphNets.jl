@@ -13,7 +13,7 @@ using Lux, LuxCUDA
 using MLUtils
 using Optimisers
 using Zygote
-using Infiltrator
+using Wandb
 
 import OrdinaryDiffEq: OrdinaryDiffEqAlgorithm, Tsit5
 import ProgressMeter: Progress
@@ -445,6 +445,8 @@ function train_network(opt, ds_path, cp_path; kws...)
         Flux.trainmode!(mgn.model)
     end
 
+    println("nf_size, ef_size nach load: ", nf_size, ef_size)
+
     clear_log(1, false)
     @info "Model built!"
     print("Compiling code...")
@@ -522,8 +524,11 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                     train_tuple_additional)
 
                 gs, losses = train_step(args.training_strategy, train_tuple)
-                # println("losses: ", losses)
                 tmp_loss += sum(losses)
+                # if sum(losses) > 20
+                #     println("datapoint: ", datapoint, " step: ", step,
+                #         " tmp_loss: ", sum(losses))
+                # end
                 weight_diff = 0
 
                 if step + datapoint > args.norm_steps
@@ -537,9 +542,6 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                                 mgn.model = Flux.destructure(mgn.model)[2](mgn.ps)
                                 weight_diff += sum(mgn.model.layers[1].node_layer.layers[1].weight[1:5] -
                                                    w_before) / 5
-                                # debug_training_snapshot(
-                                #     data, tmp_loss / datapoint, gs, mgn,
-                                #     fields, datapoint, weight_diff)
                             end
                         else
                             # w_before = copy(Array(mgn.model.layers[1].node_layer.layers[1].weight))
@@ -567,9 +569,11 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                             (:data_interval, delta == 1 ? "1:end" : 1:delta),
                             (:min_validation_loss, min_validation_loss),
                             (:last_validation_loss, last_validation_loss)])
-                    # if !isnothing(args.wandb_logger)
-                    #     Wandb.log(args.wandb_logger, Dict("train_loss" => sum(losses)))
-                    # end
+                    if !isnothing(args.wandb_logger)
+                        grad_norm = sqrt(sum(norm(g)^2 for g in gs))
+                        Wandb.log(args.wandb_logger, Dict("train_loss" => sum(losses)))
+                        Wandb.log(args.wandb_logger, Dict("grad_norm" => grad_norm))
+                    end
 
                 else
                     update!(pr, step + datapoint;
@@ -582,6 +586,9 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
             cp_progress += delta
             step += delta
             tmp_loss /= delta
+            if !isnothing(args.wandb_logger)
+                Wandb.log(args.wandb_logger, Dict("avg_loss_trajectory" => tmp_loss))
+            end
             # println("tmp_loss: ", tmp_loss) # loss averaged overy trajectory
 
             avg_loss += tmp_loss
@@ -626,11 +633,15 @@ function train_mgn!(mgn::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::D
                 end
                 # clear_log(4)
 
-                # if !isnothing(args.wandb_logger)
-                #     Wandb.log(args.wandb_logger,
-                #         Dict("validation_loss" => valid_error /
-                #                                   ds_valid.meta["n_trajectories"]))
-                # end
+                if !isnothing(args.wandb_logger)
+                    Wandb.log(args.wandb_logger,
+                        Dict("validation_loss" => valid_error /
+                                                  ds_valid.meta["n_trajectories"]))
+                    if length(valid_error) > 5
+                        Wandb.log(args.wandb_logger,
+                            Dict("error Room5" => valid_error[5]))
+                    end
+                end
                 println("Validation Error: ", valid_error / ds_valid.meta["n_trajectories"])
                 push!(validation_loss_array,
                     valid_error / ds_valid.meta["n_trajectories"])
@@ -800,6 +811,7 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
     test_loader = DataLoader(ds_test; batchsize = -1, buffer = false, parallel = false)
 
     cum_mse_return = 0.0f0
+    mse_array = Float32[]
 
     for (ti, data) in enumerate(test_loader)
         fields = deleteat!(copy(ds_test.meta["feature_names"]),
@@ -888,6 +900,8 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
             if cum_err > cum_mse_return
                 cum_mse_return = cum_err
             end
+            mse_array = vcat(mse_array, err)
+
             println("  Trajectory $ti | mse t=$(horizon): $err | cum_mse t=$(horizon): $cum_err | cum_rmse t=$(horizon): $(sqrt(cum_err))")
         end
 
@@ -919,7 +933,7 @@ function eval_network!(solver, mgn::GraphNetwork, ds_test::Dataset, out_path, st
 
     @info "Evaluation completed!"
 
-    return cum_mse_return
+    return mse_array
 end
 
 end

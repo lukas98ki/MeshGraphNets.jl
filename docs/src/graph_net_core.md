@@ -33,4 +33,6 @@ parse_edges
 one_hot
 minmaxnorm
 mse_reduce
+mse_relative
+mae_reduce
 ```

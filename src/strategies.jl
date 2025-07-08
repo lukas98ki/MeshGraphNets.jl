@@ -345,7 +345,7 @@ function train_loss(strategy::SolverTraining, t::Tuple)
 
     sol = solve(remake(prob; p = ps), strategy.solver; u0 = u0,
         saveat = (strategy.tstart):(strategy.dt):(strategy.tstop),
-        tstops = (strategy.tstart):(strategy.dt):(strategy.tstop),
+        # tstops = (strategy.tstart):(strategy.dt):(strategy.tstop),
         sensealg = strategy.sense, callback = callback_solve, strategy.solargs...)
 
     if length(target_node_fields) != 0 && length(target_edge_fields) != 0
@@ -361,23 +361,41 @@ function train_loss(strategy::SolverTraining, t::Tuple)
         edge_preds = cat(edge_preds_unshaped...; dims = 3)   # shape: (n_edge_features, n_edges, n_timesteps)
 
         normed_pred_n = cat(
-            [mgn.n_norm[target_node_fields[i]](node_preds[i, :, :])
+            [cat(
+                 [mgn.n_norm[target_node_fields[i]](node_preds[i, :, ts])
+                  for ts in axes(node_preds, 3)]...;
+                 dims = 3
+             )
              for i in 1:n_node_features]...;
             dims = 1
         )
+
         normed_gt_n = cat(
-            [mgn.n_norm[target_node_fields[i]](gt.node[i, :, :])
+            [cat(
+                 [mgn.n_norm[target_node_fields[i]](gt.node[i, :, ts])
+                  for ts in axes(gt.node, 3)]...;
+                 dims = 3
+             )
              for i in 1:n_node_features]...;
             dims = 1
         )
 
         normed_pred_e = cat(
-            [mgn.e_norm[target_edge_fields[i]](edge_preds[i, :, :])
+            [cat(
+                 [mgn.e_norm[target_edge_fields[i]](edge_preds[i, :, ts])
+                  for ts in axes(edge_preds, 3)]...;
+                 dims = 3
+             )
              for i in 1:n_edge_features]...;
             dims = 1
         )
+
         normed_gt_e = cat(
-            [mgn.e_norm[target_edge_fields[i]](gt.edge[i, :, :])
+            [cat(
+                 [mgn.e_norm[target_edge_fields[i]](gt.edge[i, :, ts])
+                  for ts in axes(gt.edge, 3)]...;
+                 dims = 3
+             )
              for i in 1:n_edge_features]...;
             dims = 1
         )
@@ -394,23 +412,39 @@ function train_loss(strategy::SolverTraining, t::Tuple)
 
         local gt_n
         local pred_n
-        println("type gt: ", typeof(gt))
         for i in eachindex(target_fields)
             if length(target_node_fields) != 0
-                pred_n = vcat([mgn.n_norm[target_fields[i]](pred[
-                                   (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, :])
-                               for i in eachindex(target_fields)]...)
-                gt_n = vcat([mgn.n_norm[target_fields[i]](gt[
-                                 (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
-                                 :, 1:size(pred, 3)]) for i in eachindex(target_fields)]...)
+                pred_n = vcat(
+                    [cat(
+                         [mgn.n_norm[target_fields[i]](pred[
+                              (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+                          for ts in axes(pred, 3)]...; dims = 3
+                     )
+                     for i in eachindex(target_fields)]...)
+                gt_n = vcat(
+                    [cat(
+                         [mgn.n_norm[target_fields[i]](gt[
+                              (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
+                              :, ts])
+                          for ts in axes(pred, 3)]...; dims = 3
+                     ) for i in eachindex(target_fields)]...)
 
             else
-                gt_n = vcat([mgn.e_norm[target_fields[i]](gt[
-                                 (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]),
-                                 :, 1:size(pred, 3)]) for i in eachindex(target_fields)]...)
-                pred_n = vcat([mgn.e_norm[target_fields[i]](pred[
-                                   (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, :])
-                               for i in eachindex(target_fields)]...)
+                pred_n = vcat(
+                    [cat(
+                         [mgn.e_norm[target_fields[i]](pred[
+                              (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+                          for ts in axes(pred, 3)]...; dims = 3
+                     )
+                     for i in eachindex(target_fields)]...)
+
+                gt_n = vcat(
+                    [cat(
+                         [mgn.e_norm[target_fields[i]](gt[
+                              (sum(target_dims[1:(i - 1)]) + 1):sum(target_dims[1:i]), :, ts])
+                          for ts in axes(pred, 3)]...; dims = 3
+                     )
+                     for i in eachindex(target_fields)]...)
             end
         end
 
@@ -591,7 +625,7 @@ end
 function train_step(::DerivativeStrategy, t::Tuple)
     mgn, graph, target_quantities_change, mask = t
 
-    return step!(mgn, graph, target_quantities_change, mask, mse_reduce)
+    return step!(mgn, graph, target_quantities_change, mask, mse_reduce)    # mse_reduce, mae_reduce, mse_relative, mae_reduce_root
 end
 
 function validation_step(::DerivativeStrategy, t::Tuple)

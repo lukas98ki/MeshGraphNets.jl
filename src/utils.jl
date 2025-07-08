@@ -85,8 +85,8 @@ function data_minmax(path)
         for ef in edge_features
             if !haskey(ds_train.meta["features"][ef], "onehot") &&
                isnumber(ds_train.meta, ef)
-                data_min = minimum(data["edge|$ef"])
-                data_max = maximum(data["edge|$ef"])
+                data_min = minimum(data["$ef"])
+                data_max = maximum(data["$ef"])
                 if data_min < result[ef][1]
                     result[ef][1] = data_min
                 end
